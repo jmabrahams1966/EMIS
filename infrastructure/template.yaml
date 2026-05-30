@@ -1,0 +1,142 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: EMIS — reads M365 mail/calendar/sent weekly, summarizes with Claude, emails + persists Monday/Wednesday/Friday agendas, exposes a web UI.
+
+Parameters:
+  AgendaSenderEmail:
+    Type: String
+    Description: SES-verified address the agenda is sent from.
+  AgendaRecipientEmail:
+    Type: String
+    Description: Your inbox.
+  GraphSecretId:
+    Type: String
+    Default: emis/graph
+  AnthropicSecretId:
+    Type: String
+    Default: emis/anthropic
+  AnthropicModel:
+    Type: String
+    Default: claude-opus-4-8
+  TodoListName:
+    Type: String
+    Default: EMIS
+  OneDriveFolder:
+    Type: String
+    Default: EMIS
+  WebUiToken:
+    Type: String
+    NoEcho: true
+    Description: Shared-secret token for the web UI (any random string >= 24 chars).
+  MondaySchedule:
+    Type: String
+    Default: cron(0 11 ? * MON *)
+    Description: Monday 06:00 ET = 11:00 UTC.
+  WednesdaySchedule:
+    Type: String
+    Default: cron(0 13 ? * WED *)
+    Description: Wednesday 08:00 ET = 13:00 UTC.
+  FridaySchedule:
+    Type: String
+    Default: cron(0 20 ? * FRI *)
+    Description: Friday 15:00 ET = 20:00 UTC.
+
+Resources:
+
+  StateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-attachments
+            Status: Enabled
+            Prefix: runs/
+            ExpirationInDays: 365
+
+  AgendaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../
+      Handler: src.handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          GRAPH_SECRET_ID: !Ref GraphSecretId
+          ANTHROPIC_SECRET_ID: !Ref AnthropicSecretId
+          ANTHROPIC_MODEL: !Ref AnthropicModel
+          AGENDA_SENDER: !Ref AgendaSenderEmail
+          AGENDA_RECIPIENT: !Ref AgendaRecipientEmail
+          STATE_BUCKET: !Ref StateBucket
+          TODO_LIST_NAME: !Ref TodoListName
+          ONEDRIVE_FOLDER: !Ref OneDriveFolder
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+                - secretsmanager:PutSecretValue
+              Resource:
+                - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GraphSecretId}*
+                - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AnthropicSecretId}*
+            - Effect: Allow
+              Action: [ses:SendEmail, ses:SendRawEmail]
+              Resource: '*'
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject, s3:ListBucket]
+              Resource:
+                - !GetAtt StateBucket.Arn
+                - !Sub ${StateBucket.Arn}/*
+      Events:
+        Monday:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref MondaySchedule
+            Input: '{"mode": "monday"}'
+        Wednesday:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref WednesdaySchedule
+            Input: '{"mode": "wednesday"}'
+        Friday:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref FridaySchedule
+            Input: '{"mode": "friday"}'
+
+  WebUiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../
+      Handler: src.web_ui.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          STATE_BUCKET: !Ref StateBucket
+          WEB_UI_TOKEN: !Ref WebUiToken
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [s3:GetObject, s3:ListBucket]
+              Resource:
+                - !GetAtt StateBucket.Arn
+                - !Sub ${StateBucket.Arn}/*
+      FunctionUrlConfig:
+        AuthType: NONE  # auth via WEB_UI_TOKEN in query string
+
+Outputs:
+  FunctionArn:
+    Value: !GetAtt AgendaFunction.Arn
+  StateBucketName:
+    Value: !Ref StateBucket
+  WebUiUrl:
+    Value: !GetAtt WebUiFunctionUrl.FunctionUrl
+    Description: Append ?token=YOUR_WEB_UI_TOKEN to access.

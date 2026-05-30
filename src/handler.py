@@ -1,0 +1,309 @@
+"""EMIS Lambda entry point — orchestrates the weekly/midweek/Friday run.
+
+The same Lambda is invoked by three EventBridge rules with different
+``mode`` values: ``monday``, ``wednesday``, ``friday``.
+
+Pipeline (per run):
+    1. OAuth refresh → access token (rotate refresh token if it changed)
+    2. Load VIP + blocklist from S3
+    3. Fetch inbox mail + sent mail + calendar events for the relevant window
+    4. Filter mail (drop blocklist, keep VIP) and group into threads
+    5. Extract attachments
+    6. Load prior 4 weeks of agendas from S3 for cross-week memory
+    7. Build agenda via Claude (mode-aware prompt, prompt-cached system)
+    8. Render Markdown + PDF
+    9. Persist all artifacts to S3
+   10. Side effects:
+        - SES email
+        - Create / update OneDrive Markdown + PDF
+        - Create Microsoft To Do tasks for action items (dedup)
+        - Create / update calendar event with agenda in the body
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from . import extract
+from .agenda.builder import build_agenda
+from .agenda.filters import apply_filters, load_blocklist, load_vip
+from .agenda.memory import load_prior_agendas
+from .agenda.threading import group_into_threads
+from .config import load_config
+from .email.sender import render_html, render_text, send_via_ses
+from .export import markdown as md_export
+from .graph import auth as graph_auth
+from .graph import calendar as graph_calendar
+from .graph import onedrive as graph_onedrive
+from .graph import todo as graph_todo
+from .graph.mail import default_since, fetch_attachments, list_messages_since, list_sent_messages_since
+from .state import store
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+)
+logger = logging.getLogger("emis")
+
+
+def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    """Entry point invoked by EventBridge. Mode comes from the event."""
+    mode = (event or {}).get("mode") or os.getenv("MODE", "monday")
+    return asyncio.run(_run(mode))
+
+
+async def _run(mode: str) -> dict[str, Any]:
+    cfg = load_config()
+    now = datetime.now(timezone.utc)
+    since = default_since(cfg.lookback_days)
+
+    # 1. Auth
+    tokens = await graph_auth.exchange_refresh_token(
+        tenant_id=cfg.graph_tenant_id,
+        client_id=cfg.graph_client_id,
+        client_secret=cfg.graph_client_secret,
+        refresh_token=cfg.graph_refresh_token,
+    )
+    if not cfg.dry_run and tokens.refresh_token != cfg.graph_refresh_token:
+        graph_auth.rotate_refresh_token_secret(
+            os.environ["GRAPH_SECRET_ID"], tokens.refresh_token
+        )
+
+    # 2. Filters from S3
+    vip = load_vip(cfg.state_bucket) if cfg.state_bucket else []
+    blocklist = load_blocklist(cfg.state_bucket) if cfg.state_bucket else []
+
+    # 3. Fetch in parallel
+    cal_start, cal_end = _calendar_window(mode, now)
+    messages, sent, calendar_events = await asyncio.gather(
+        list_messages_since(
+            access_token=tokens.access_token, since=since,
+            max_messages=cfg.max_messages,
+        ),
+        list_sent_messages_since(
+            access_token=tokens.access_token, since=since,
+            max_messages=cfg.max_sent_messages,
+        ),
+        graph_calendar.list_events_in_range(
+            access_token=tokens.access_token, start=cal_start, end=cal_end,
+        ),
+    )
+    logger.info(
+        "fetched: inbox=%d sent=%d calendar=%d",
+        len(messages), len(sent), len(calendar_events),
+    )
+
+    # 4. Filter + thread
+    filtered, dropped = apply_filters(messages, vip, blocklist)
+    threads = group_into_threads(filtered, vip)
+
+    # 5. Attachments
+    attachment_texts = await _extract_all_attachments(
+        access_token=tokens.access_token,
+        messages=filtered,
+        bucket=cfg.state_bucket,
+        week_start=since,
+        max_bytes=cfg.max_attachment_bytes,
+        dry_run=cfg.dry_run,
+    )
+
+    # 6. Memory
+    prior = (
+        load_prior_agendas(cfg.state_bucket, since)
+        if cfg.state_bucket else []
+    )
+
+    # 7. Build the agenda
+    result = build_agenda(
+        mode=mode,
+        threads=threads,
+        sent_messages=sent,
+        calendar_events=calendar_events,
+        prior_agendas=prior,
+        attachment_texts=attachment_texts,
+        week_start=since,
+        week_end=now,
+        api_key=cfg.anthropic_api_key,
+        model=cfg.anthropic_model,
+    )
+
+    # 9. Persist (was step 9 in the docstring; renders below)
+    if cfg.state_bucket and not cfg.dry_run:
+        store.save_agenda(cfg.state_bucket, since, mode, result.agenda)
+
+    # 8. Render
+    html = render_html(result.agenda, since, now, mode=mode)
+    text = render_text(result.agenda, since, now, mode=mode)
+    md_text = md_export.render(result.agenda, since, now, mode=mode)
+    try:
+        from .export import pdf as pdf_export  # lazy: avoids fpdf2 import at module load
+        pdf_bytes = pdf_export.render(result.agenda, since, now, mode=mode)
+    except Exception as exc:
+        logger.warning("PDF render failed: %s", exc)
+        pdf_bytes = None
+
+    if cfg.state_bucket and not cfg.dry_run:
+        store.save_artifact(cfg.state_bucket, since, f"agenda.{mode}.md", md_text.encode("utf-8"), "text/markdown")
+        if pdf_bytes:
+            store.save_artifact(cfg.state_bucket, since, f"agenda.{mode}.pdf", pdf_bytes, "application/pdf")
+
+    subject = _email_subject(mode, now)
+
+    if cfg.dry_run:
+        print(text)
+        return {"status": "dry_run", "mode": mode, "tokens": _token_dict(result)}
+
+    # 10. Side effects
+    side_effects: dict[str, Any] = {}
+
+    side_effects["ses"] = send_via_ses(
+        sender=cfg.agenda_sender, recipient=cfg.agenda_recipient,
+        subject=subject, html=html, text=text,
+    ).get("MessageId")
+
+    if cfg.upload_to_onedrive:
+        side_effects["onedrive"] = await _upload_to_onedrive(
+            access_token=tokens.access_token,
+            folder=cfg.onedrive_folder,
+            week_start=since, mode=mode,
+            md=md_text, pdf_bytes=pdf_bytes,
+        )
+
+    if cfg.create_todo_tasks and mode in ("monday", "wednesday"):
+        side_effects["todo"] = await graph_todo.sync_action_items(
+            access_token=tokens.access_token,
+            list_name=cfg.todo_list_name,
+            action_items=[
+                a for a in result.agenda.get("action_items", [])
+                if a.get("status") in ("new", "carried_over")
+                and (a.get("owner", "").lower() == "you" or a.get("owner") == "")
+            ],
+        )
+
+    if cfg.create_calendar_event and mode == "monday":
+        try:
+            side_effects["calendar_event"] = await graph_calendar.upsert_weekly_plan_event(
+                access_token=tokens.access_token, week_of=now, html_body=html,
+            )
+        except Exception as exc:
+            logger.warning("calendar event upsert failed: %s", exc)
+            side_effects["calendar_event"] = {"error": str(exc)}
+
+    return {
+        "status": "sent", "mode": mode,
+        "messages_processed": len(messages),
+        "messages_dropped_by_filter": dropped,
+        "threads": len(threads),
+        "sent_messages": len(sent),
+        "calendar_events": len(calendar_events),
+        "attachments_extracted": sum(len(v) for v in attachment_texts.values()),
+        "tokens": _token_dict(result),
+        "side_effects": side_effects,
+    }
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def _calendar_window(mode: str, now: datetime) -> tuple[datetime, datetime]:
+    """Calendar window depends on mode.
+
+      monday    → coming 7 days
+      wednesday → rest of this week (today through Sunday)
+      friday    → coming Monday through next Sunday (look-ahead)
+    """
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if mode == "monday":
+        return midnight, midnight + timedelta(days=7)
+    if mode == "wednesday":
+        end_of_week = midnight + timedelta(days=(6 - midnight.weekday()) + 1)
+        return midnight, end_of_week
+    # friday
+    days_to_monday = (7 - midnight.weekday()) % 7 or 7
+    next_monday = midnight + timedelta(days=days_to_monday)
+    return next_monday, next_monday + timedelta(days=7)
+
+
+def _email_subject(mode: str, now: datetime) -> str:
+    return {
+        "monday": f"Weekly agenda — week of {now.strftime('%b %d, %Y')}",
+        "wednesday": f"Mid-week check-in — {now.strftime('%b %d, %Y')}",
+        "friday": f"End-of-week recap — {now.strftime('%b %d, %Y')}",
+    }.get(mode, f"EMIS agenda — {now.strftime('%b %d, %Y')}")
+
+
+def _token_dict(result) -> dict[str, int]:
+    return {
+        "input": result.input_tokens, "output": result.output_tokens,
+        "cache_read": result.cache_read_tokens,
+        "cache_write": result.cache_creation_tokens,
+    }
+
+
+async def _extract_all_attachments(
+    *, access_token, messages, bucket, week_start, max_bytes, dry_run,
+):
+    out: dict[str, list[tuple[str, str]]] = {}
+    for msg in messages:
+        if not msg.has_attachments:
+            continue
+        try:
+            atts = await fetch_attachments(
+                access_token=access_token, message_id=msg.id, max_bytes=max_bytes,
+            )
+        except Exception as exc:
+            logger.warning("attachment fetch failed for %s: %s", msg.id, exc)
+            continue
+        extracted = []
+        for att in atts:
+            if bucket and not dry_run:
+                try:
+                    store.save_attachment(
+                        bucket, week_start, msg.id, att.name,
+                        att.content_bytes, att.content_type,
+                    )
+                except Exception as exc:
+                    logger.warning("S3 put failed for %s: %s", att.name, exc)
+            text = extract.extract(att.name, att.content_type, att.content_bytes)
+            if text:
+                extracted.append((att.name, text))
+        if extracted:
+            out[msg.id] = extracted
+    return out
+
+
+async def _upload_to_onedrive(*, access_token, folder, week_start, mode, md, pdf_bytes):
+    iso = week_start.isocalendar()
+    base = f"{folder}/{iso.year:04d}-W{iso.week:02d}"
+    results: dict[str, Any] = {}
+    try:
+        results["md"] = await graph_onedrive.upload_file(
+            access_token=access_token,
+            path=f"{base}/agenda.{mode}.md",
+            data=md.encode("utf-8"),
+            content_type="text/markdown",
+        )
+    except Exception as exc:
+        logger.warning("OneDrive md upload failed: %s", exc)
+        results["md"] = {"error": str(exc)}
+    if pdf_bytes:
+        try:
+            results["pdf"] = await graph_onedrive.upload_file(
+                access_token=access_token,
+                path=f"{base}/agenda.{mode}.pdf",
+                data=pdf_bytes,
+                content_type="application/pdf",
+            )
+        except Exception as exc:
+            logger.warning("OneDrive pdf upload failed: %s", exc)
+            results["pdf"] = {"error": str(exc)}
+    return results
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "monday"
+    result = asyncio.run(_run(mode))
+    print(result)
