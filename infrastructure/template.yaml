@@ -44,6 +44,10 @@ Parameters:
     Type: String
     Default: cron(30 10 ? * MON-FRI *)
     Description: Daily 06:30 ET = 10:30 UTC for pre-meeting briefs.
+  SnoozePollSchedule:
+    Type: String
+    Default: rate(30 minutes)
+    Description: How often the reply-command Lambda polls the inbox for snooze instructions.
 
 Resources:
 
@@ -128,6 +132,50 @@ Resources:
           Properties:
             Schedule: !Ref MorningSchedule
             Input: '{"mode": "morning"}'
+
+  SnoozeFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ../
+      Handler: src.snooze.lambda_handler
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          GRAPH_SECRET_ID: !Ref GraphSecretId
+          ANTHROPIC_SECRET_ID: !Ref AnthropicSecretId
+          ANTHROPIC_MODEL: !Ref AnthropicModel
+          AGENDA_SENDER: !Ref AgendaSenderEmail
+          AGENDA_RECIPIENT: !Ref AgendaRecipientEmail
+          STATE_BUCKET: !Ref StateBucket
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+                - secretsmanager:PutSecretValue
+              Resource:
+                - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GraphSecretId}*
+                - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AnthropicSecretId}*
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject, s3:ListBucket]
+              Resource:
+                - !GetAtt StateBucket.Arn
+                - !Sub ${StateBucket.Arn}/*
+            - Effect: Allow
+              Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+              Resource:
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.*
+                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*anthropic.*
+      Events:
+        Poll:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref SnoozePollSchedule
 
   WebUiFunction:
     Type: AWS::Serverless::Function

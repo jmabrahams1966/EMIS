@@ -1,4 +1,10 @@
-"""Render the agenda as a PDF using fpdf2 (pure Python, lightweight)."""
+"""Render the agenda as a PDF using fpdf2 (pure Python, lightweight).
+
+fpdf2's default Helvetica is latin-1 only — any em-dash, ellipsis, bullet,
+or accented character outside latin-1 makes ``cell()`` raise. Rather than
+ship a Unicode TTF (~700KB), we sanitize all strings on the way in: replace
+common Unicode punctuation with ASCII equivalents and drop the rest.
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -8,12 +14,49 @@ from fpdf import FPDF
 
 _PAGE_W = 190  # A4 - margins
 
+_UNICODE_REPLACEMENTS = {
+    "—": "-",      # em-dash
+    "–": "-",      # en-dash
+    "…": "...",    # horizontal ellipsis
+    "•": "*",      # bullet
+    "↻": "(c)",    # clockwise open circle arrow (carried_over marker)
+    "✓": "[ok]",   # check mark (resolved marker)
+    "⚠": "(!)",    # warning sign (stale marker)
+    "→": "->",     # rightwards arrow
+    "←": "<-",     # leftwards arrow
+    "“": '"',      # left double quote
+    "”": '"',      # right double quote
+    "‘": "'",      # left single quote
+    "’": "'",      # right single quote
+}
+
+
+def _ascii_safe(text: str) -> str:
+    """Best-effort sanitize a string for fpdf2's latin-1 Helvetica."""
+    if not text:
+        return text
+    for k, v in _UNICODE_REPLACEMENTS.items():
+        text = text.replace(k, v)
+    # Strip anything else outside latin-1 rather than crashing.
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def _sanitize(obj: Any) -> Any:
+    """Recursively sanitize every string in an agenda dict / list."""
+    if isinstance(obj, str):
+        return _ascii_safe(obj)
+    if isinstance(obj, list):
+        return [_sanitize(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    return obj
+
 
 class _AgendaPDF(FPDF):
     def header(self):
         self.set_font("Helvetica", "B", 9)
         self.set_text_color(150)
-        self.cell(0, 5, "EMIS — E-Mail Ingestor and Scheduler", align="R")
+        self.cell(0, 5, "EMIS - E-Mail Ingestor and Scheduler", align="R")
         self.ln(8)
         self.set_text_color(0)
 
@@ -38,7 +81,7 @@ def _para(pdf: FPDF, text: str, size: int = 11) -> None:
 
 def _bullet(pdf: FPDF, head: str, sub: str = "", link: str = "") -> None:
     pdf.set_font("Helvetica", "B", 10)
-    pdf.multi_cell(_PAGE_W, 5, f"•  {head}", link=link or "")
+    pdf.multi_cell(_PAGE_W, 5, f"*  {head}", link=link or "")
     if sub:
         pdf.set_font("Helvetica", "", 10)
         pdf.set_x(pdf.get_x() + 6)
@@ -47,6 +90,11 @@ def _bullet(pdf: FPDF, head: str, sub: str = "", link: str = "") -> None:
 
 
 def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mode: str) -> bytes:
+    # Sanitize every string in the agenda once, up front. Cheaper than
+    # wrapping every cell()/multi_cell() call and catches any non-latin-1
+    # character Claude emitted (em-dashes, ellipses, arrows, accents).
+    agenda = _sanitize(agenda)
+
     title = {
         "monday": "Weekly Agenda",
         "wednesday": "Mid-Week Check-in",

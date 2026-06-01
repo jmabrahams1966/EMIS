@@ -6,7 +6,7 @@
 # invokes `make build-<LogicalId>` and expects the built artifact in
 # $(ARTIFACTS_DIR).
 
-.PHONY: build-AgendaFunction build-WebUiFunction
+.PHONY: build-AgendaFunction build-WebUiFunction build-SnoozeFunction
 
 build-AgendaFunction:
 	@mkdir -p "$(ARTIFACTS_DIR)"
@@ -14,6 +14,11 @@ build-AgendaFunction:
 	python -m pip install -r requirements.txt -t "$(ARTIFACTS_DIR)/" --quiet
 
 build-WebUiFunction:
+	@mkdir -p "$(ARTIFACTS_DIR)"
+	cp -R src "$(ARTIFACTS_DIR)/"
+	python -m pip install -r requirements.txt -t "$(ARTIFACTS_DIR)/" --quiet
+
+build-SnoozeFunction:
 	@mkdir -p "$(ARTIFACTS_DIR)"
 	cp -R src "$(ARTIFACTS_DIR)/"
 	python -m pip install -r requirements.txt -t "$(ARTIFACTS_DIR)/" --quiet

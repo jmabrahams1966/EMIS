@@ -42,6 +42,7 @@ from .graph import calendar as graph_calendar
 from .graph import onedrive as graph_onedrive
 from .graph import todo as graph_todo
 from .graph.mail import default_since, fetch_attachments, list_messages_since, list_sent_messages_since
+from .snooze import active_snoozes, load_snoozes
 from .state import store
 
 logging.basicConfig(
@@ -124,6 +125,12 @@ async def _run(mode: str) -> dict[str, Any]:
         if cfg.state_bucket else []
     )
 
+    # 6b. Snoozes — only the still-active ones get passed to the prompt.
+    snoozes_active = (
+        [s.to_dict() for s in active_snoozes(load_snoozes(cfg.state_bucket), now)]
+        if cfg.state_bucket else []
+    )
+
     # 7. Build the agenda
     result = build_agenda(
         mode=mode,
@@ -137,6 +144,7 @@ async def _run(mode: str) -> dict[str, Any]:
         api_key=cfg.anthropic_api_key,
         model=cfg.anthropic_model,
         aws_region=cfg.aws_region,
+        snoozes=snoozes_active,
     )
 
     # 9. Persist (was step 9 in the docstring; renders below)

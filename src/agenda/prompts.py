@@ -73,6 +73,17 @@ Linking back to the source:
   calendar event, or sent message). Copy the URL verbatim. If the item \
   draws from multiple sources or no single source is identifiable, leave \
   `web_link` as an empty string. Do not invent URLs.
+
+User-defined snoozes:
+- A SNOOZED ITEMS block may appear in the user turn listing items the user \
+  has explicitly asked to defer ("snooze the Costco thread until Monday"). \
+  Each entry is `<item_match> until <YYYY-MM-DD>`. If an incoming thread, \
+  action item, or follow-up clearly corresponds to a snoozed entry whose \
+  `until` date is in the future, suppress it: do not include it in \
+  priorities, action_items, or follow_ups. You may mention it in \
+  `week_summary` if it's load-bearing context, but otherwise leave it out. \
+  If the `until` date has passed (the user turn will only list active \
+  snoozes), the item is fair game again.
 """
 
 

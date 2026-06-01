@@ -9,11 +9,12 @@ web UI.
 ## How it runs
 
 ```
-EventBridge (4 schedules)
+EventBridge (5 schedules)
   ├─ Mon 06:00 ET → weekly plan (priorities, meetings, action items, etc.)
   ├─ Wed 08:00 ET → mid-week check-in (what's slipping?)
   ├─ Fri 15:00 ET → end-of-week recap + look-ahead
-  └─ Daily 06:30 ET (Mon-Fri) → pre-meeting briefs for today's calendar
+  ├─ Daily 06:30 ET (Mon-Fri) → pre-meeting briefs for today's calendar
+  └─ Every 30 min → snooze poller (parses agenda-email replies)
 
 Lambda (one function, mode-aware)
   ├─ Graph: Mail.Read (all folders except Drafts/Sent/Outbox/Junk/Deleted), Calendars.ReadWrite, Tasks.ReadWrite, Files.ReadWrite
@@ -107,6 +108,24 @@ week), `resolved` (recently closed — surfaced in `week_summary`), or `stale`
    EOF
    ```
    These are loaded fresh on every run — no redeploy needed.
+
+## Replying to snooze
+
+Hit Reply on any EMIS email and tell it which items to defer:
+
+```
+snooze the Costco DCF thread until next Monday
+snooze horizon enrollment for 2 weeks
+```
+
+A second Lambda polls your inbox every 30 min, parses replies via Claude
+(natural language — phrasing doesn't matter), and writes snoozes to
+`s3://<state-bucket>/state/snoozes.json`. The next agenda run reads them
+and suppresses matching items from priorities / action_items / follow_ups
+until the `until` date passes. Snoozes auto-expire and are pruned after 90
+days.
+
+Drop / done / delegate aren't supported yet — only snooze.
 
 ## Web UI
 
