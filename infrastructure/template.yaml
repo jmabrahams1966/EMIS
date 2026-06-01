@@ -58,6 +58,8 @@ Resources:
 
   AgendaFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
     Properties:
       CodeUri: ../
       Handler: src.handler.lambda_handler
@@ -111,6 +113,8 @@ Resources:
 
   WebUiFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
     Properties:
       CodeUri: ../
       Handler: src.web_ui.lambda_handler

@@ -1,16 +1,12 @@
 """Call Claude to convert a week of email + calendar + memory into a
 structured agenda.
 
-Caching strategy:
-  - System prompt is fully frozen and shared across all three modes (Monday,
-    Wednesday, Friday) so the cache prefix is byte-identical.
-  - ``cache_control: ephemeral`` on the last system block caches system text
-    + (empty) tools list. Reads on every run after the first.
-  - All volatile data — mode header, week range, calendar, sent mail, threads,
-    prior agendas — goes in the user turn after the breakpoint.
-  - ``cache_creation_input_tokens`` / ``cache_read_input_tokens`` are logged.
-
 Output: structured JSON via ``output_config.format``.
+
+On prompt caching: we don't bother. The system prompt is ~600 tokens, well
+under Opus 4.7's 4096-token cache-write minimum, and runs are 48+ hours
+apart — longer than any cache TTL. Reads will always miss, so adding
+``cache_control`` would just pay the write premium for nothing.
 """
 from __future__ import annotations
 
@@ -33,6 +29,10 @@ logger = logging.getLogger(__name__)
 MAX_BODY_CHARS = 3_500
 MAX_ATTACHMENT_CHARS = 5_000
 MAX_TOTAL_CHARS = 700_000
+# Per-section caps so a single noisy section can't crowd out the rest.
+MAX_CALENDAR_CHARS = 50_000
+MAX_SENT_CHARS = 40_000
+MAX_MEMORY_CHARS = 100_000
 
 
 @dataclass
@@ -74,13 +74,7 @@ def build_agenda(
     with client.messages.stream(
         model=model,
         max_tokens=8_000,
-        system=[
-            {
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            },
-        ],
+        system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_content}],
         thinking={"type": "adaptive"},
         output_config={
@@ -137,9 +131,9 @@ def _render_user_turn(
         f"Today's date: {week_end.date().isoformat()}\n"
     )
     chunks: list[str] = [header]
-    chunks.append(render_memory_block(prior_agendas))
-    chunks.append(_render_calendar(calendar_events))
-    chunks.append(_render_sent(sent_messages))
+    chunks.append(render_memory_block(prior_agendas, max_chars=MAX_MEMORY_CHARS))
+    chunks.append(_render_calendar(calendar_events, max_chars=MAX_CALENDAR_CHARS))
+    chunks.append(_render_sent(sent_messages, max_chars=MAX_SENT_CHARS))
     chunks.append("===== INCOMING THREADS =====\n")
 
     total = sum(len(c) for c in chunks)
@@ -159,41 +153,59 @@ def _render_user_turn(
     return "".join(chunks)
 
 
-def _render_calendar(events: list[CalendarEvent]) -> str:
+def _render_calendar(events: list[CalendarEvent], max_chars: int = MAX_CALENDAR_CHARS) -> str:
     if not events:
         return "===== CALENDAR =====\n(none scheduled)\n\n"
     lines = ["===== CALENDAR ====="]
-    for ev in events:
+    used = len(lines[0])
+    dropped = 0
+    for idx, ev in enumerate(events):
         when = ev.start.strftime("%a %Y-%m-%d %H:%MZ")
         end = ev.end.strftime("%H:%MZ")
         attendees = ", ".join(a for a in ev.attendees if a)[:200]
-        loc = f"  Location: {ev.location}" if ev.location else ""
-        lines.append(
+        block = [
             f"  • {when}–{end}  {ev.subject}"
             + (f"  [{ev.importance}]" if ev.importance and ev.importance != "normal" else "")
-        )
+        ]
         if attendees:
-            lines.append(f"    Attendees: {attendees}")
-        if loc:
-            lines.append(loc)
+            block.append(f"    Attendees: {attendees}")
+        if ev.location:
+            block.append(f"  Location: {ev.location}")
+        block_text = "\n".join(block)
+        if used + len(block_text) + 1 > max_chars:
+            dropped = len(events) - idx
+            break
+        lines.append(block_text)
+        used += len(block_text) + 1
+    if dropped:
+        lines.append(f"[+{dropped} more calendar events truncated to fit budget]")
     lines.append("")
     return "\n".join(lines) + "\n"
 
 
-def _render_sent(messages: list[Message]) -> str:
+def _render_sent(messages: list[Message], max_chars: int = MAX_SENT_CHARS) -> str:
     if not messages:
         return "===== SENT MAIL =====\n(none)\n\n"
     lines = ["===== SENT MAIL (commitments you may have made) ====="]
-    for m in messages[:50]:
+    used = len(lines[0])
+    dropped = 0
+    for idx, m in enumerate(messages):
         body = (m.body_text or m.preview or "").strip().replace("\n", " ")
         if len(body) > 400:
             body = body[:400] + "…"
-        lines.append(
+        block = (
             f"\n--- TO {', '.join(m.to_recipients)[:120]} ---\n"
             f"Subject: {m.subject}\n"
             f"Sent: {m.received_at.isoformat()}\n"
             f"{body}"
         )
+        if used + len(block) > max_chars:
+            dropped = len(messages) - idx
+            break
+        lines.append(block)
+        used += len(block)
+    if dropped:
+        lines.append(f"\n[+{dropped} more sent messages truncated to fit budget]")
     lines.append("")
     return "\n".join(lines) + "\n"
 

@@ -6,15 +6,23 @@ Deployed as a separate Lambda behind a Function URL. Single route:
     GET /?token=…&week=2026-W22   → expanded view of that week's modes
     GET /?token=…&week=…&mode=monday  → full agenda for that week+mode
 
-Auth: a single shared-secret token in the ``token`` query param, compared
-against ``WEB_UI_TOKEN`` (env var). For single-user personal use this is
-adequate; not appropriate for multi-tenant deployment.
+Auth: a single shared-secret token compared against ``WEB_UI_TOKEN`` (env
+var) using a constant-time compare. The token can be supplied either as
+``Authorization: Bearer …`` (preferred — doesn't leak into CloudWatch
+access logs or browser history) or as the ``token`` query string parameter
+(for browser navigation). Responses set ``Referrer-Policy: no-referrer`` so
+the token doesn't leak via the Referer header when the user clicks an
+outbound link.
+
+For single-user personal use this is adequate; not appropriate for
+multi-tenant deployment.
 
 State source: the S3 bucket EMIS writes to. The Lambda needs read-only S3
 access to ``runs/`` under that bucket.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -37,41 +45,56 @@ def _resp(body: str, status: int = 200, content_type: str = "text/html; charset=
         "headers": {
             "Content-Type": content_type,
             "Cache-Control": "private, no-store",
+            "Referrer-Policy": "no-referrer",
         },
         "body": body,
     }
 
 
-def _require_token(qs: dict[str, str]) -> str | None:
+def _extract_token(event: dict[str, Any]) -> str:
+    """Prefer ``Authorization: Bearer …``; fall back to ``?token=`` for browser use."""
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    auth = headers.get("authorization", "") or ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    qs = (event.get("queryStringParameters") or {}) or {}
+    return qs.get("token", "") or ""
+
+
+def _check_auth(event: dict[str, Any]) -> str | None:
     expected = os.getenv("WEB_UI_TOKEN") or ""
     if not expected:
         return "Server misconfigured: WEB_UI_TOKEN is not set."
-    given = qs.get("token", "")
-    if given != expected:
+    given = _extract_token(event)
+    if not given or not hmac.compare_digest(given, expected):
         return "Unauthorized."
     return None
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    qs = (event.get("queryStringParameters") or {}) or {}
-    err = _require_token(qs)
+    err = _check_auth(event)
     if err is not None:
         return _resp(_chrome("EMIS", f"<p>{escape(err)}</p>"), status=403)
 
     bucket = os.environ["STATE_BUCKET"]
+    qs = (event.get("queryStringParameters") or {}) or {}
     week = qs.get("week")
     mode = qs.get("mode")
+    # Link generation needs the token so browser navigation keeps working. If
+    # the caller only supplied a header, generated links omit it — Authorization
+    # must then be re-supplied by the client on each request.
+    link_token = qs.get("token", "") or ""
 
     if week and mode:
         agenda = store.load_agenda(bucket, week, mode)
         if not agenda:
             return _resp(_chrome("Not found", "<p>No agenda for that week / mode.</p>"), status=404)
-        return _resp(_render_agenda_page(bucket, week, mode, agenda, qs["token"]))
+        return _resp(_render_agenda_page(bucket, week, mode, agenda, link_token))
 
     if week:
-        return _resp(_render_week_page(bucket, week, qs["token"]))
+        return _resp(_render_week_page(bucket, week, link_token))
 
-    return _resp(_render_index_page(bucket, qs["token"]))
+    return _resp(_render_index_page(bucket, link_token))
 
 
 # ── Rendering ──────────────────────────────────────────────────────────────

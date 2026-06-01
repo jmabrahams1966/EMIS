@@ -53,33 +53,47 @@ def load_prior_agendas(bucket: str, current_week: datetime) -> list[dict[str, An
     return out
 
 
-def render_memory_block(prior: list[dict[str, Any]]) -> str:
+def render_memory_block(prior: list[dict[str, Any]], max_chars: int = 100_000) -> str:
     """Render the prior agendas into a compact text block for the prompt.
 
     Only the open-ended sections (priorities, action_items, follow_ups) are
-    included — meetings and FYI from prior weeks aren't actionable.
+    included — meetings and FYI from prior weeks aren't actionable. Truncated
+    at ``max_chars`` (newest week kept).
     """
     if not prior:
         return "No prior agendas on record. This is the first run.\n"
 
-    lines: list[str] = ["===== PRIOR AGENDAS (oldest to newest) ====="]
+    rendered = ["===== PRIOR AGENDAS (oldest to newest) ====="]
+    # ``prior`` is newest-first; reverse to render oldest-first.
     for entry in reversed(prior):
         iso = entry["iso_week"]
         a = entry["agenda"]
-        lines.append(f"\n--- Week {iso} ---")
+        block = [f"\n--- Week {iso} ---"]
         if a.get("priorities"):
-            lines.append("Priorities:")
+            block.append("Priorities:")
             for p in a["priorities"]:
-                lines.append(f"  • {p.get('title', '')}")
+                block.append(f"  • {p.get('title', '')}")
         if a.get("action_items"):
-            lines.append("Action items:")
+            block.append("Action items:")
             for it in a["action_items"]:
                 owner = it.get("owner", "")
-                lines.append(f"  • [{owner}] {it.get('task', '')}")
+                block.append(f"  • [{owner}] {it.get('task', '')}")
         if a.get("follow_ups"):
-            lines.append("Follow-ups:")
+            block.append("Follow-ups:")
             for f in a["follow_ups"]:
                 cp = f.get("counterparty", "")
-                lines.append(f"  • [{cp}] {f.get('thread', '')} — {f.get('ask', '')}")
-    lines.append("")
-    return "\n".join(lines) + "\n"
+                block.append(f"  • [{cp}] {f.get('thread', '')} — {f.get('ask', '')}")
+        rendered.append("\n".join(block))
+
+    # Drop oldest weeks first if the block is too big; the prompt cares more
+    # about recent context. rendered[0] is the header.
+    out = "\n".join(rendered) + "\n"
+    dropped = 0
+    while len(out) > max_chars and len(rendered) > 2:
+        del rendered[1]
+        dropped += 1
+        out = "\n".join(rendered) + "\n"
+    if dropped:
+        rendered.insert(1, f"[+{dropped} older week(s) truncated to fit budget]")
+        out = "\n".join(rendered) + "\n"
+    return out

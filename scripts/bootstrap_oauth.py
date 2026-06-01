@@ -20,7 +20,6 @@ import http.server
 import os
 import secrets
 import socketserver
-import threading
 import urllib.parse
 import webbrowser
 
@@ -83,14 +82,13 @@ def main() -> None:
     )
 
     server = socketserver.TCPServer((REDIRECT_HOST, REDIRECT_PORT), _CodeCatcher)
-    threading.Thread(target=server.handle_request, daemon=True).start()
 
     print(f"Opening browser to:\n  {auth_url}\n")
     webbrowser.open(auth_url)
 
-    server.server_close = lambda: None  # ensure handle_request finishes
-    while _CodeCatcher.code is None and _CodeCatcher.error is None:
-        pass
+    # Blocks until the redirect comes in and the handler sets code/error,
+    # then returns. No busy-wait, no threading.
+    server.handle_request()
 
     if _CodeCatcher.error:
         raise SystemExit(f"OAuth failed: {_CodeCatcher.error}")

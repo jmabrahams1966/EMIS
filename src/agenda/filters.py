@@ -3,15 +3,29 @@
 Both lists live as JSON in S3 so they can be edited without redeploying:
 
     s3://{bucket}/config/vip_senders.json
-        ["jane@example.com", "ceo@example.com", "@board.example.com"]
+        ["jane@example.com", "@board.example.com"]
 
     s3://{bucket}/config/blocklist.json
         ["no-reply@", "notifications@", "newsletter@",
          "@mailchimp.com", "@constantcontact.com"]
 
-Each entry is matched as a case-insensitive substring against the sender's
-email address. VIP senders are *always* surfaced; blocklist senders are
-dropped before the prompt is built. VIP wins over blocklist on conflict.
+Matching rules differ between the lists because the cost of a false positive
+differs.
+
+**VIP** (false positive = bypasses filtering — must be strict):
+  - ``@domain.example`` → domain match, including subdomains (so
+    ``@board.example.com`` matches ``alice@board.example.com`` and
+    ``alice@team.board.example.com``).
+  - ``alice@example.com`` → exact email match.
+  - Anything else (substring tokens, bare domains without ``@``) is *ignored*
+    — substring matching on emails is unsafe, e.g. ``"jane@example.com"`` as
+    a substring would also match ``evil-jane@example.com.attacker.tld``.
+
+**Blocklist** (false positive = drop a real email — annoying but recoverable):
+  - Case-insensitive substring match against the sender, as before. The usual
+    patterns (``no-reply@``, ``@mailchimp.com``) work intuitively.
+
+VIP wins over blocklist on conflict.
 """
 from __future__ import annotations
 
@@ -55,8 +69,25 @@ def load_blocklist(bucket: str) -> list[str]:
 
 
 def is_vip(sender_email: str, vip_patterns: Iterable[str]) -> bool:
-    e = (sender_email or "").lower()
-    return any(p in e for p in vip_patterns)
+    """See module docstring for the matching rules."""
+    e = (sender_email or "").strip().lower()
+    if not e or "@" not in e:
+        return False
+    _, _, domain = e.rpartition("@")
+    for raw in vip_patterns:
+        p = (raw or "").strip().lower()
+        if not p:
+            continue
+        if p.startswith("@"):
+            tail = p[1:]
+            if tail and (domain == tail or domain.endswith("." + tail)):
+                return True
+        elif "@" in p:
+            if e == p:
+                return True
+        # else: silently skip — unsafe substring entries are documented as
+        # ignored, not as substring matches.
+    return False
 
 
 def is_blocked(sender_email: str, blocklist_patterns: Iterable[str]) -> bool:

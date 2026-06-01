@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Iterable
 
 from ..graph.mail import Message
+from .filters import is_vip
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ def group_into_threads(
         for p in [msg.sender_email, *msg.to_recipients, *msg.cc_recipients]:
             if p and p not in t.participants:
                 t.participants.append(p)
-        if vip_patterns and any(p in msg.sender_email.lower() for p in vip_patterns):
+        if vip_patterns and is_vip(msg.sender_email, vip_patterns):
             t.is_vip = True
 
     threads = sorted(buckets.values(), key=lambda t: t.latest_received or datetime.min, reverse=True)

@@ -52,7 +52,10 @@ week), `resolved` (recently closed — surfaced in `week_summary`), or `stale`
 
 1. **Register an Azure app** (Entra ID → App registrations → New registration).
    - Account type: *Accounts in any organizational directory and personal Microsoft accounts*
-   - Redirect URI (public client): `http://localhost:8765/callback`
+   - Redirect URI (public client / "Mobile and desktop applications"
+     platform): `http://127.0.0.1:8765/callback` (the bootstrap script binds
+     to `127.0.0.1`, and Entra treats `localhost` and `127.0.0.1` as distinct
+     URIs — using the wrong one returns AADSTS900971).
    - API permissions → Microsoft Graph → Delegated:
      `Mail.Read`, `Calendars.ReadWrite`, `Tasks.ReadWrite`, `Files.ReadWrite`,
      `User.Read`, `offline_access`. Grant consent.
@@ -88,10 +91,16 @@ week), `resolved` (recently closed — surfaced in `week_summary`), or `stale`
 
 6. **(Optional)** Edit the VIP and blocklist:
    ```bash
+   # VIP — strict matching only (a false positive bypasses filtering):
+   #   "alice@example.com"  → exact email match
+   #   "@example.com"       → domain, including subdomains
+   #   anything else        → ignored (substring matching on emails is unsafe)
    aws s3 cp - s3://<state-bucket>/config/vip_senders.json <<'EOF'
    ["ceo@example.com", "@board.example.com", "investor@vc.com"]
    EOF
 
+   # Blocklist — case-insensitive substring match (a false positive just
+   # drops a real email, so substring is fine here):
    aws s3 cp - s3://<state-bucket>/config/blocklist.json <<'EOF'
    ["no-reply@", "notifications@", "newsletter@", "@mailchimp.com"]
    EOF
@@ -157,11 +166,13 @@ infrastructure/
 
 ## Cost notes
 
-- The system prompt is byte-frozen across runs and `cache_control: ephemeral`
-  reads it on every run except the first. Cache hits are logged.
 - A typical run is ~30-150K input tokens (inbox + threads + calendar + memory)
-  and ~2-5K output. With caching, the recurring marginal cost is well under
-  $1/week on opus-4-7.
+  and ~2-5K output. On opus-4-7 at $5/M input / $25/M output that's roughly
+  $0.20-$0.80 per run, $0.60-$2.50/week across the three runs.
+- Prompt caching is not used: the system prompt is ~600 tokens (well under
+  Opus 4.7's 4096-token cache-write minimum) and runs are 48+ hours apart
+  (longer than any ephemeral cache TTL). Adding `cache_control` would just
+  pay the write premium for no reads.
 - SES outbound: 1 email per run × 3 runs/week.
 - Lambda: ≤ 15 min per run; small.
 - S3: a few MB per week including attachments. Lifecycle expires after 365d.
