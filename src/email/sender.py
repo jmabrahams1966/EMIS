@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from collections import defaultdict
+from datetime import date, datetime, timedelta
 from html import escape
 from typing import Any
 
@@ -12,6 +13,59 @@ logger = logging.getLogger(__name__)
 
 _STATUS_MARK = {"new": "•", "carried_over": "↻", "resolved": "✓", "stale": "⚠"}
 _URGENCY_COLOR = {"high": "#c0392b", "medium": "#d68910", "low": "#7f8c8d"}
+
+
+def _bucket_by_due(action_items: list[dict[str, Any]], today: date) -> dict[str, list[dict]]:
+    """Group action_items into 'this week / this month / this quarter / later'.
+
+    Items without a parseable due_date land under 'undated'.
+    """
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for a in action_items:
+        raw = (a.get("due_date") or "").strip()
+        try:
+            due = date.fromisoformat(raw)
+        except ValueError:
+            buckets["undated"].append(a)
+            continue
+        days = (due - today).days
+        if days <= 7:
+            buckets["this week"].append(a)
+        elif days <= 30:
+            buckets["this month"].append(a)
+        elif days <= 90:
+            buckets["this quarter"].append(a)
+        else:
+            buckets["later"].append(a)
+    return buckets
+
+
+def _counterparty_rollup(agenda: dict[str, Any]) -> dict[str, dict[str, list]]:
+    """Build per-counterparty buckets of {owed_to_you, owed_by_you, joint}.
+
+    - follow_ups → things owed to you
+    - promises_made → things you owe them
+    - action_items with non-self owner → things they owe you
+    """
+    by_party: dict[str, dict[str, list]] = defaultdict(lambda: {"owed_to_you": [], "owed_by_you": []})
+    for f in agenda.get("follow_ups", []):
+        cp = (f.get("counterparty") or "").strip()
+        if cp:
+            by_party[cp]["owed_to_you"].append(f)
+    for p in agenda.get("promises_made", []):
+        to = (p.get("to") or "").strip()
+        if to:
+            by_party[to]["owed_by_you"].append(p)
+    for a in agenda.get("action_items", []):
+        owner = (a.get("owner") or "").strip()
+        if owner and owner.lower() != "you":
+            by_party[owner]["owed_to_you"].append(a)
+    # Only return counterparties with >= 2 items across both buckets — single
+    # mentions aren't worth a rollup section.
+    return {
+        cp: buckets for cp, buckets in by_party.items()
+        if len(buckets["owed_to_you"]) + len(buckets["owed_by_you"]) >= 2
+    }
 
 
 def _linked(title_html: str, web_link: str) -> str:
@@ -51,7 +105,12 @@ def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime
     def _priority_li(p: dict) -> str:
         title = _linked(f"<strong>{escape(p['title'])}</strong>", p.get("web_link", ""))
         src = f" <em style='color:#666'>({escape(p['source_subject'])})</em>" if p.get("source_subject") else ""
-        return f"{urgency_badge(p.get('urgency', 'medium'))} {title} — {escape(p['reason'])}{src}"
+        why = (
+            f"<br><span style='color:#888;font-size:12px;font-style:italic'>"
+            f"Why now: {escape(p['why_now'])}</span>"
+            if p.get("why_now") else ""
+        )
+        return f"{urgency_badge(p.get('urgency', 'medium'))} {title} — {escape(p['reason'])}{src}{why}"
 
     def _meeting_li(m: dict) -> str:
         title = _linked(f"<strong>{escape(m['subject'])}</strong>", m.get("web_link", ""))
@@ -95,6 +154,45 @@ def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime
     ])
     if agenda.get("promises_made"):
         body_html += section("Promises you made", promises)
+
+    # Computed sections — derived from the data above, no extra LLM tokens.
+    today = week_end.date()
+    buckets = _bucket_by_due(agenda.get("action_items", []), today)
+    bucket_order = ("this week", "this month", "this quarter", "later")
+    coming_up_html = ""
+    for label in bucket_order:
+        items = buckets.get(label, [])
+        if not items:
+            continue
+        rows = "".join(
+            f"<li>{_linked(escape(a.get('task', '')), a.get('web_link', ''))} "
+            f"<span style='color:#666;font-size:12px'>"
+            f"({escape(a.get('due', '') or a.get('due_date', ''))}, "
+            f"{escape(a.get('owner', '?'))})</span></li>"
+            for a in items
+        )
+        coming_up_html += (
+            f"<h3 style='margin:14px 0 4px;font-size:13px;color:#666'>"
+            f"{label.title()}</h3>"
+            f"<ul style='line-height:1.55;margin-top:0'>{rows}</ul>"
+        )
+    if coming_up_html:
+        body_html += section("Coming up (by due date)", coming_up_html)
+
+    rollup = _counterparty_rollup(agenda)
+    if rollup:
+        rows = ""
+        for cp, b in sorted(rollup.items(), key=lambda kv: -(len(kv[1]["owed_to_you"]) + len(kv[1]["owed_by_you"]))):
+            owed_to = len(b["owed_to_you"])
+            owed_by = len(b["owed_by_you"])
+            rows += (
+                f"<li><strong>{escape(cp)}</strong> "
+                f"<span style='color:#666;font-size:12px'>"
+                f"({owed_to} waiting on them, {owed_by} you owe)"
+                f"</span></li>"
+            )
+        body_html += section("By counterparty", f"<ul style='line-height:1.55'>{rows}</ul>")
+
     body_html += section("FYI", fyi)
 
     return f"""\
@@ -130,6 +228,8 @@ def render_text(agenda: dict[str, Any], week_start: datetime, week_end: datetime
         link = f"\n      {p['web_link']}" if p.get("web_link") else ""
         lines.append(f"  • [{p.get('urgency', 'medium')}] {p['title']}{src}")
         lines.append(f"      {p['reason']}{link}")
+        if p.get("why_now"):
+            lines.append(f"      Why now: {p['why_now']}")
 
     lines += ["", "MEETINGS"]
     for m in agenda.get("meetings", []):
@@ -164,6 +264,31 @@ def render_text(agenda: dict[str, Any], week_start: datetime, week_end: datetime
             lines.append(f"  • {p['commitment']} → {p['to']} by {p['by']}")
             if p.get("web_link"):
                 lines.append(f"      {p['web_link']}")
+
+    # Computed sections
+    today = week_end.date()
+    buckets = _bucket_by_due(agenda.get("action_items", []), today)
+    bucket_order = ("this week", "this month", "this quarter", "later")
+    coming_up_lines: list[str] = []
+    for label in bucket_order:
+        items = buckets.get(label, [])
+        if not items:
+            continue
+        coming_up_lines.append(f"  {label.upper()}")
+        for a in items:
+            due = a.get("due", "") or a.get("due_date", "")
+            coming_up_lines.append(f"    • {a.get('task', '')}  ({due}, {a.get('owner', '?')})")
+    if coming_up_lines:
+        lines += ["", "COMING UP (by due date)", *coming_up_lines]
+
+    rollup = _counterparty_rollup(agenda)
+    if rollup:
+        lines += ["", "BY COUNTERPARTY"]
+        for cp, b in sorted(rollup.items(), key=lambda kv: -(len(kv[1]["owed_to_you"]) + len(kv[1]["owed_by_you"]))):
+            lines.append(
+                f"  • {cp} — {len(b['owed_to_you'])} waiting on them, "
+                f"{len(b['owed_by_you'])} you owe"
+            )
 
     lines += ["", "FYI"]
     for x in agenda.get("fyi", []):

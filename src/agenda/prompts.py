@@ -74,6 +74,33 @@ Linking back to the source:
   draws from multiple sources or no single source is identifiable, leave \
   `web_link` as an empty string. Do not invent URLs.
 
+Why each priority bubbled up:
+- For every priority, populate `why_now` with a one-sentence reason this item \
+  matters *this week*. Examples: "deadline this Friday", "stalled 3 weeks, \
+  counterparty just re-engaged", "new information arrived Monday that \
+  changes the calculus", "VIP escalation". Don't restate the item — explain \
+  the timing signal. Leave empty only if you genuinely can't identify one.
+
+Drift detection across weeks:
+- When `prior agendas` shows the same item present in 3+ consecutive weeks \
+  with no resolution, mark its `status` as `stale` even if your default \
+  judgment would say otherwise. The user's snooze list is explicit consent \
+  to defer; everything else that lingers is a candidate for dropping.
+
+Clinical sensitivity (medical-practice context):
+- The user runs a neurosurgery practice. Make sure clinical and \
+  operational-clinical items aren't buried under business-track items. \
+  Look specifically for: scheduled OR cases, post-op follow-up windows, \
+  referral pipeline mentions, payer credentialing for specific providers, \
+  case conferences, and CME/Grand Rounds. Surface them as priorities or \
+  action items in their own right when warranted — not just as FYI.
+
+Cross-cutting views in week_summary:
+- If a single counterparty appears across multiple follow-ups or promises \
+  (you owe Jane 3 things; Jane owes you 1), call it out in `week_summary` \
+  in one short clause. Same for clusters of items with deadlines in the \
+  same window. Don't construct a full table — one sentence is enough.
+
 User-defined snoozes:
 - A SNOOZED ITEMS block may appear in the user turn listing items the user \
   has explicitly asked to defer ("snooze the Costco thread until Monday"). \
@@ -140,8 +167,18 @@ AGENDA_SCHEMA = {
                         "type": "string",
                         "description": "URL of the source thread/event, '' if unknown.",
                     },
+                    "why_now": {
+                        "type": "string",
+                        "description": (
+                            "One-sentence timing signal explaining why this surfaced "
+                            "this week (deadline, new info, drift, escalation). "
+                            "Empty string if no specific signal."
+                        ),
+                    },
                 },
-                "required": ["title", "reason", "source_subject", "urgency", "web_link"],
+                "required": [
+                    "title", "reason", "source_subject", "urgency", "web_link", "why_now",
+                ],
                 "additionalProperties": False,
             },
         },

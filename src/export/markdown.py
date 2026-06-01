@@ -1,12 +1,54 @@
 """Render the agenda as Markdown for OneDrive archival."""
 from __future__ import annotations
 
-from datetime import datetime
+from collections import defaultdict
+from datetime import date, datetime
 from typing import Any
 
 
 def _md_link(text: str, url: str) -> str:
     return f"[{text}]({url})" if url else text
+
+
+def _bucket_by_due(action_items: list[dict[str, Any]], today: date) -> dict[str, list[dict]]:
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for a in action_items:
+        raw = (a.get("due_date") or "").strip()
+        try:
+            due = date.fromisoformat(raw)
+        except ValueError:
+            buckets["undated"].append(a)
+            continue
+        days = (due - today).days
+        if days <= 7:
+            buckets["this week"].append(a)
+        elif days <= 30:
+            buckets["this month"].append(a)
+        elif days <= 90:
+            buckets["this quarter"].append(a)
+        else:
+            buckets["later"].append(a)
+    return buckets
+
+
+def _counterparty_rollup(agenda: dict[str, Any]) -> dict[str, dict[str, list]]:
+    by_party: dict[str, dict[str, list]] = defaultdict(lambda: {"owed_to_you": [], "owed_by_you": []})
+    for f in agenda.get("follow_ups", []):
+        cp = (f.get("counterparty") or "").strip()
+        if cp:
+            by_party[cp]["owed_to_you"].append(f)
+    for p in agenda.get("promises_made", []):
+        to = (p.get("to") or "").strip()
+        if to:
+            by_party[to]["owed_by_you"].append(p)
+    for a in agenda.get("action_items", []):
+        owner = (a.get("owner") or "").strip()
+        if owner and owner.lower() != "you":
+            by_party[owner]["owed_to_you"].append(a)
+    return {
+        cp: b for cp, b in by_party.items()
+        if len(b["owed_to_you"]) + len(b["owed_by_you"]) >= 2
+    }
 
 
 def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mode: str) -> str:
@@ -31,6 +73,8 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
         out.append(bullet)
         if p.get("reason"):
             out.append(f"    - {p['reason']}")
+        if p.get("why_now"):
+            out.append(f"    - *Why now: {p['why_now']}*")
     out.append("")
 
     out.append("## Meetings")
@@ -76,6 +120,33 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
         for p in agenda["promises_made"]:
             title = _md_link(f"**{p.get('commitment', '')}**", p.get("web_link", ""))
             out.append(f"- {title} to {p.get('to', '')} by {p.get('by', '')}")
+        out.append("")
+
+    # Computed sections — derived from existing data.
+    today = week_end.date()
+    buckets = _bucket_by_due(agenda.get("action_items", []), today)
+    bucket_order = ("this week", "this month", "this quarter", "later")
+    coming_up_blocks = [
+        f"### {label.title()}\n" + "\n".join(
+            f"- {_md_link(a.get('task', ''), a.get('web_link', ''))} "
+            f"({a.get('due', '') or a.get('due_date', '')}, {a.get('owner', '?')})"
+            for a in buckets.get(label, [])
+        )
+        for label in bucket_order if buckets.get(label)
+    ]
+    if coming_up_blocks:
+        out.append("## Coming up (by due date)")
+        out.extend(coming_up_blocks)
+        out.append("")
+
+    rollup = _counterparty_rollup(agenda)
+    if rollup:
+        out.append("## By counterparty")
+        for cp, b in sorted(rollup.items(), key=lambda kv: -(len(kv[1]["owed_to_you"]) + len(kv[1]["owed_by_you"]))):
+            out.append(
+                f"- **{cp}** — {len(b['owed_to_you'])} waiting on them, "
+                f"{len(b['owed_by_you'])} you owe"
+            )
         out.append("")
 
     out.append("## FYI")

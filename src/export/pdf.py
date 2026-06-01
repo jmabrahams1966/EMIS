@@ -12,6 +12,8 @@ from typing import Any
 
 from fpdf import FPDF
 
+from .markdown import _bucket_by_due, _counterparty_rollup
+
 _PAGE_W = 190  # A4 - margins
 
 _UNICODE_REPLACEMENTS = {
@@ -122,6 +124,8 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
         sub = p.get("reason", "")
         if p.get("source_subject"):
             sub += f"   (source: {p['source_subject']})"
+        if p.get("why_now"):
+            sub += f"\nWhy now: {p['why_now']}"
         _bullet(pdf, head, sub, link=p.get("web_link", ""))
 
     _heading(pdf, "Meetings")
@@ -159,6 +163,31 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
             if p.get("source_subject"):
                 sub += f"   (source: {p['source_subject']})"
             _bullet(pdf, head, sub, link=p.get("web_link", ""))
+
+    today = week_end.date()
+    buckets = _bucket_by_due(agenda.get("action_items", []), today)
+    bucket_order = ("this week", "this month", "this quarter", "later")
+    if any(buckets.get(label) for label in bucket_order):
+        _heading(pdf, "Coming up (by due date)")
+        for label in bucket_order:
+            items = buckets.get(label, [])
+            if not items:
+                continue
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.multi_cell(_PAGE_W, 5, label.title())
+            for a in items:
+                due = a.get("due", "") or a.get("due_date", "")
+                _bullet(pdf, f"{a.get('task', '')}", f"({due}, {a.get('owner', '?')})",
+                        link=a.get("web_link", ""))
+
+    rollup = _counterparty_rollup(agenda)
+    if rollup:
+        _heading(pdf, "By counterparty")
+        for cp, b in sorted(rollup.items(), key=lambda kv: -(len(kv[1]["owed_to_you"]) + len(kv[1]["owed_by_you"]))):
+            _bullet(
+                pdf, cp,
+                f"{len(b['owed_to_you'])} waiting on them, {len(b['owed_by_you'])} you owe",
+            )
 
     _heading(pdf, "FYI")
     for x in agenda.get("fyi", []):
