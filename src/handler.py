@@ -29,12 +29,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import extract
+from .agenda.briefs import build_briefs
 from .agenda.builder import build_agenda
 from .agenda.filters import apply_filters, load_blocklist, load_vip
 from .agenda.memory import load_prior_agendas
 from .agenda.threading import group_into_threads
 from .config import load_config
-from .email.sender import render_html, render_text, send_via_ses
+from .email.sender import render_briefs_html, render_briefs_text, render_html, render_text, send_via_ses
 from .export import markdown as md_export
 from .graph import auth as graph_auth
 from .graph import calendar as graph_calendar
@@ -53,6 +54,8 @@ logger = logging.getLogger("emis")
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Entry point invoked by EventBridge. Mode comes from the event."""
     mode = (event or {}).get("mode") or os.getenv("MODE", "monday")
+    if mode == "morning":
+        return asyncio.run(_run_briefs())
     return asyncio.run(_run(mode))
 
 
@@ -216,6 +219,100 @@ async def _run(mode: str) -> dict[str, Any]:
     }
 
 
+async def _run_briefs() -> dict[str, Any]:
+    """Pre-meeting briefs flow — separate from the weekly agenda pipeline.
+
+    Fetches today's calendar events, pulls 4 weeks of mail with each event's
+    attendees, asks Claude for a short brief per meeting, and emails them.
+    Skips silently when no meetings are on the calendar today.
+    """
+    cfg = load_config()
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
+    mail_since = now - timedelta(days=28)
+
+    # 1. Auth
+    tokens = await graph_auth.exchange_refresh_token(
+        tenant_id=cfg.graph_tenant_id,
+        client_id=cfg.graph_client_id,
+        client_secret=cfg.graph_client_secret,
+        refresh_token=cfg.graph_refresh_token,
+    )
+    if not cfg.dry_run and tokens.refresh_token != cfg.graph_refresh_token:
+        graph_auth.rotate_refresh_token_secret(
+            os.environ["GRAPH_SECRET_ID"], tokens.refresh_token
+        )
+        cfg.graph_refresh_token = tokens.refresh_token
+
+    # 2. Today's calendar events
+    events = await graph_calendar.list_events_in_range(
+        access_token=tokens.access_token, start=today_start, end=today_end,
+    )
+    if not events:
+        logger.info("morning: no meetings today, skipping")
+        return {"status": "skipped", "mode": "morning", "reason": "no meetings"}
+
+    # 3. Last 4 weeks of mail (folder-wide scan)
+    messages = await list_messages_since(
+        access_token=tokens.access_token,
+        since=mail_since,
+        max_messages=cfg.max_messages,
+    )
+
+    # 4. Filter (no thread grouping yet — briefs.py handles per-meeting grouping)
+    vip = load_vip(cfg.state_bucket) if cfg.state_bucket else []
+    blocklist = load_blocklist(cfg.state_bucket) if cfg.state_bucket else []
+    filtered, dropped = apply_filters(messages, vip, blocklist)
+    logger.info(
+        "morning: meetings=%d mail=%d (dropped %d)",
+        len(events), len(filtered), dropped,
+    )
+
+    # 5. Build briefs
+    result = build_briefs(
+        events=events,
+        messages=filtered,
+        self_email=cfg.agenda_recipient,
+        now=now,
+        api_key=cfg.anthropic_api_key,
+        model=cfg.anthropic_model,
+        aws_region=cfg.aws_region,
+    )
+
+    # 6. Render
+    html = render_briefs_html(result.briefs, now)
+    text = render_briefs_text(result.briefs, now)
+    subject = f"Today's briefs — {now.strftime('%a %b %d')}"
+
+    if cfg.dry_run:
+        print(text)
+        return {
+            "status": "dry_run", "mode": "morning",
+            "meetings": len(events), "briefs": len(result.briefs),
+            "tokens": {"input": result.input_tokens, "output": result.output_tokens},
+        }
+
+    # 7. Send
+    try:
+        ses_resp = send_via_ses(
+            sender=cfg.agenda_sender, recipient=cfg.agenda_recipient,
+            subject=subject, html=html, text=text,
+        )
+        ses_id = ses_resp.get("MessageId")
+    except Exception as exc:
+        logger.warning("SES send failed: %s", exc)
+        ses_id = {"error": str(exc)}
+
+    return {
+        "status": "sent", "mode": "morning",
+        "meetings": len(events),
+        "briefs": len(result.briefs),
+        "tokens": {"input": result.input_tokens, "output": result.output_tokens},
+        "ses": ses_id,
+    }
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _calendar_window(mode: str, now: datetime) -> tuple[datetime, datetime]:
@@ -315,5 +412,8 @@ async def _upload_to_onedrive(*, access_token, folder, week_start, mode, md, pdf
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "monday"
-    result = asyncio.run(_run(mode))
+    if mode == "morning":
+        result = asyncio.run(_run_briefs())
+    else:
+        result = asyncio.run(_run(mode))
     print(result)

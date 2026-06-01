@@ -9,10 +9,11 @@ web UI.
 ## How it runs
 
 ```
-EventBridge (3 schedules)
+EventBridge (4 schedules)
   ├─ Mon 06:00 ET → weekly plan (priorities, meetings, action items, etc.)
   ├─ Wed 08:00 ET → mid-week check-in (what's slipping?)
-  └─ Fri 15:00 ET → end-of-week recap + look-ahead
+  ├─ Fri 15:00 ET → end-of-week recap + look-ahead
+  └─ Daily 06:30 ET (Mon-Fri) → pre-meeting briefs for today's calendar
 
 Lambda (one function, mode-aware)
   ├─ Graph: Mail.Read (all folders except Drafts/Sent/Outbox/Junk/Deleted), Calendars.ReadWrite, Tasks.ReadWrite, Files.ReadWrite

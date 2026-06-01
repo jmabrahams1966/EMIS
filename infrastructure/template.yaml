@@ -40,6 +40,10 @@ Parameters:
     Type: String
     Default: cron(0 20 ? * FRI *)
     Description: Friday 15:00 ET = 20:00 UTC.
+  MorningSchedule:
+    Type: String
+    Default: cron(30 10 ? * MON-FRI *)
+    Description: Daily 06:30 ET = 10:30 UTC for pre-meeting briefs.
 
 Resources:
 
@@ -119,6 +123,11 @@ Resources:
           Properties:
             Schedule: !Ref FridaySchedule
             Input: '{"mode": "friday"}'
+        Morning:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref MorningSchedule
+            Input: '{"mode": "morning"}'
 
   WebUiFunction:
     Type: AWS::Serverless::Function

@@ -86,19 +86,20 @@ def build_agenda(
         week_start=week_start, week_end=week_end,
     )
 
-    # 64K gives adaptive thinking room to work without truncating output;
-    # we're already streaming so HTTP timeouts aren't a concern.
+    # 64K gives the model room to produce the full agenda without truncating;
+    # we're streaming so HTTP timeouts aren't a concern.
     kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": 64_000,
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": user_content}],
-        "thinking": {"type": "adaptive"},
     }
     if is_bedrock:
-        # Bedrock doesn't accept output_config.format yet. Force a tool call
-        # with the same schema as input_schema — the agenda comes back as the
-        # tool_use block's input dict.
+        # Bedrock doesn't accept output_config.format yet — force a tool call
+        # with the same schema as input_schema; the agenda comes back as the
+        # tool_use block's input dict. Bedrock also rejects `thinking` when
+        # tool_choice forces a specific tool, so adaptive thinking is dropped
+        # on this path — quality is still good enough for synthesis-to-JSON.
         kwargs["tools"] = [{
             "name": "build_agenda",
             "description": "Emit the structured agenda for the week.",
@@ -106,6 +107,7 @@ def build_agenda(
         }]
         kwargs["tool_choice"] = {"type": "tool", "name": "build_agenda"}
     else:
+        kwargs["thinking"] = {"type": "adaptive"}
         kwargs["output_config"] = {
             "format": {"type": "json_schema", "schema": AGENDA_SCHEMA},
             "effort": "high",
