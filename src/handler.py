@@ -170,8 +170,18 @@ async def _run(mode: str) -> dict[str, Any]:
     subject = _email_subject(mode, now)
 
     if cfg.dry_run:
+        previews = _write_previews(
+            name=f"agenda.{mode}",
+            html=html, text=text, md=md_text, pdf_bytes=pdf_bytes,
+        )
+        if previews:
+            logger.info("wrote previews: %s", ", ".join(previews.values()))
         print(text)
-        return {"status": "dry_run", "mode": mode, "tokens": _token_dict(result)}
+        return {
+            "status": "dry_run", "mode": mode,
+            "tokens": _token_dict(result),
+            "previews": previews,
+        }
 
     # 10. Side effects — each is best-effort so one failure (e.g. SES sandbox,
     # OneDrive 5xx) doesn't block the rest.
@@ -294,11 +304,15 @@ async def _run_briefs() -> dict[str, Any]:
     subject = f"Today's briefs — {now.strftime('%a %b %d')}"
 
     if cfg.dry_run:
+        previews = _write_previews(name="briefs.morning", html=html, text=text)
+        if previews:
+            logger.info("wrote previews: %s", ", ".join(previews.values()))
         print(text)
         return {
             "status": "dry_run", "mode": "morning",
             "meetings": len(events), "briefs": len(result.briefs),
             "tokens": {"input": result.input_tokens, "output": result.output_tokens},
+            "previews": previews,
         }
 
     # 7. Send
@@ -319,6 +333,48 @@ async def _run_briefs() -> dict[str, Any]:
         "tokens": {"input": result.input_tokens, "output": result.output_tokens},
         "ses": ses_id,
     }
+
+
+def _write_previews(
+    *,
+    name: str,
+    html: str,
+    text: str,
+    md: str | None = None,
+    pdf_bytes: bytes | None = None,
+) -> dict[str, str]:
+    """Write rendered outputs to ``$PREVIEW_DIR`` so they can be opened directly.
+
+    Used during local dry-runs to let the user see exactly what each surface
+    looks like — open ``agenda.monday.html`` in a browser, ``agenda.monday.pdf``
+    in Preview, etc. No-op when ``PREVIEW_DIR`` is unset.
+    """
+    preview_dir = os.getenv("PREVIEW_DIR")
+    if not preview_dir:
+        return {}
+    os.makedirs(preview_dir, exist_ok=True)
+    written: dict[str, str] = {}
+    paths = {
+        "html": os.path.join(preview_dir, f"{name}.html"),
+        "txt": os.path.join(preview_dir, f"{name}.txt"),
+    }
+    with open(paths["html"], "w", encoding="utf-8") as f:
+        f.write(html)
+    written["html"] = paths["html"]
+    with open(paths["txt"], "w", encoding="utf-8") as f:
+        f.write(text)
+    written["txt"] = paths["txt"]
+    if md is not None:
+        md_path = os.path.join(preview_dir, f"{name}.md")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(md)
+        written["md"] = md_path
+    if pdf_bytes is not None:
+        pdf_path = os.path.join(preview_dir, f"{name}.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(pdf_bytes)
+        written["pdf"] = pdf_path
+    return written
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────

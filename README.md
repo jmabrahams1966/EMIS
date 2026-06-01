@@ -146,8 +146,22 @@ export ANTHROPIC_API_KEY=...
 export AGENDA_RECIPIENT=you@yourdomain.com
 export AGENDA_SENDER=agenda@yourdomain.com
 export DRY_RUN=1                # print agenda, skip SES/To Do/Calendar/OneDrive
-python -m src.handler monday    # or wednesday, friday
+python -m src.handler monday    # or wednesday, friday, morning
 ```
+
+To see what the formatted email and PDF actually look like (rather than just
+the plaintext fallback printed to the terminal), set `PREVIEW_DIR`:
+
+```bash
+export PREVIEW_DIR=./preview
+python -m src.handler monday
+
+open preview/agenda.monday.html     # opens in browser → same render as the email
+open preview/agenda.monday.pdf      # opens in Preview → same as OneDrive archive
+```
+
+The morning briefs flow writes `briefs.morning.html` / `.txt` (no PDF/MD for
+briefs).
 
 ## Repo layout
 
