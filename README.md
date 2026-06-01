@@ -15,12 +15,12 @@ EventBridge (3 schedules)
   └─ Fri 15:00 ET → end-of-week recap + look-ahead
 
 Lambda (one function, mode-aware)
-  ├─ Graph: Mail.Read (Inbox + SentItems), Calendars.ReadWrite, Tasks.ReadWrite, Files.ReadWrite
+  ├─ Graph: Mail.Read (all folders except Drafts/Sent/Outbox/Junk/Deleted), Calendars.ReadWrite, Tasks.ReadWrite, Files.ReadWrite
   ├─ Filter (VIP allowlist + automated-mail blocklist; both editable in S3)
   ├─ Thread grouping (by conversationId)
   ├─ Cross-week memory (last 4 weeks of agendas → status: new/carried_over/resolved/stale)
   ├─ Attachment text extraction (PDF / DOCX / XLSX / HTML)
-  ├─ Claude API: opus-4-7 + adaptive thinking + cached system prompt + json_schema output
+  ├─ Claude: opus-4-7 via public API (json_schema output) or Bedrock (forced tool-use)
   └─ Side effects:
        ├─ SES — emails the agenda
        ├─ Microsoft To Do — creates one task per action item (deduped)

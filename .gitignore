@@ -6,4 +6,6 @@ __pycache__/
 *.zip
 .DS_Store
 .agents/
+.claude/
+skills-lock.json
 

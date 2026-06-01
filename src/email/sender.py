@@ -14,6 +14,17 @@ _STATUS_MARK = {"new": "•", "carried_over": "↻", "resolved": "✓", "stale":
 _URGENCY_COLOR = {"high": "#c0392b", "medium": "#d68910", "low": "#7f8c8d"}
 
 
+def _linked(title_html: str, web_link: str) -> str:
+    """Wrap a title fragment in a subtle link if web_link is non-empty."""
+    if not web_link:
+        return title_html
+    return (
+        f"<a href='{escape(web_link)}' "
+        f"style='color:inherit;text-decoration:underline;text-decoration-color:#aaa'>"
+        f"{title_html}</a>"
+    )
+
+
 def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mode: str = "monday") -> str:
     title = {
         "monday": "Weekly Agenda",
@@ -37,40 +48,43 @@ def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime
         c = _URGENCY_COLOR.get(u, "#7f8c8d")
         return f"<span style='color:{c};font-size:11px;text-transform:uppercase'>{u}</span>"
 
-    priorities = ul([
-        f"{urgency_badge(p.get('urgency', 'medium'))} "
-        f"<strong>{escape(p['title'])}</strong> — {escape(p['reason'])}"
-        + (f" <em style='color:#666'>({escape(p['source_subject'])})</em>" if p.get("source_subject") else "")
-        for p in agenda.get("priorities", [])
-    ])
-    meetings = ul([
-        f"<strong>{escape(m['subject'])}</strong> "
-        f"<span style='color:#888;font-size:11px'>[{escape(m.get('source', '?'))}]</span> "
-        f"— {escape(m['when'])} with {escape(m['participants'])}"
-        + (f"<br><span style='color:#555'>Prep: {escape(m['prep_notes'])}</span>" if m.get("prep_notes") else "")
-        for m in agenda.get("meetings", [])
-    ])
-    actions = ul([
-        f"{status_badge(a.get('status', 'new'))} "
-        f"<strong>{escape(a['task'])}</strong> "
-        f"<span style='color:#666;font-size:12px'>"
-        f"({escape(a.get('owner', '?'))}, due {escape(a.get('due', ''))}, "
-        f"{urgency_badge(a.get('urgency', 'medium'))})</span>"
-        + (f" <em style='color:#666'>({escape(a['source_subject'])})</em>" if a.get("source_subject") else "")
-        for a in agenda.get("action_items", [])
-    ])
-    follow_ups = ul([
-        f"{status_badge(f.get('status', 'new'))} "
-        f"<strong>{escape(f['thread'])}</strong> — waiting on "
-        f"{escape(f['counterparty'])}: {escape(f['ask'])}"
-        + (f" <span style='color:#888'>(open {f['weeks_open']}w)</span>" if f.get("weeks_open") else "")
-        for f in agenda.get("follow_ups", [])
-    ])
-    promises = ul([
-        f"<strong>{escape(p['commitment'])}</strong> "
-        f"<span style='color:#666'>to {escape(p['to'])} by {escape(p['by'])}</span>"
-        for p in agenda.get("promises_made", [])
-    ])
+    def _priority_li(p: dict) -> str:
+        title = _linked(f"<strong>{escape(p['title'])}</strong>", p.get("web_link", ""))
+        src = f" <em style='color:#666'>({escape(p['source_subject'])})</em>" if p.get("source_subject") else ""
+        return f"{urgency_badge(p.get('urgency', 'medium'))} {title} — {escape(p['reason'])}{src}"
+
+    def _meeting_li(m: dict) -> str:
+        title = _linked(f"<strong>{escape(m['subject'])}</strong>", m.get("web_link", ""))
+        prep = f"<br><span style='color:#555'>Prep: {escape(m['prep_notes'])}</span>" if m.get("prep_notes") else ""
+        return (
+            f"{title} <span style='color:#888;font-size:11px'>[{escape(m.get('source', '?'))}]</span> "
+            f"— {escape(m['when'])} with {escape(m['participants'])}{prep}"
+        )
+
+    def _action_li(a: dict) -> str:
+        title = _linked(f"<strong>{escape(a['task'])}</strong>", a.get("web_link", ""))
+        src = f" <em style='color:#666'>({escape(a['source_subject'])})</em>" if a.get("source_subject") else ""
+        return (
+            f"{status_badge(a.get('status', 'new'))} {title} "
+            f"<span style='color:#666;font-size:12px'>"
+            f"({escape(a.get('owner', '?'))}, due {escape(a.get('due', ''))}, "
+            f"{urgency_badge(a.get('urgency', 'medium'))})</span>{src}"
+        )
+
+    def _followup_li(f: dict) -> str:
+        title = _linked(f"<strong>{escape(f['thread'])}</strong>", f.get("web_link", ""))
+        weeks = f" <span style='color:#888'>(open {f['weeks_open']}w)</span>" if f.get("weeks_open") else ""
+        return f"{status_badge(f.get('status', 'new'))} {title} — waiting on {escape(f['counterparty'])}: {escape(f['ask'])}{weeks}"
+
+    def _promise_li(p: dict) -> str:
+        title = _linked(f"<strong>{escape(p['commitment'])}</strong>", p.get("web_link", ""))
+        return f"{title} <span style='color:#666'>to {escape(p['to'])} by {escape(p['by'])}</span>"
+
+    priorities = ul([_priority_li(p) for p in agenda.get("priorities", [])])
+    meetings = ul([_meeting_li(m) for m in agenda.get("meetings", [])])
+    actions = ul([_action_li(a) for a in agenda.get("action_items", [])])
+    follow_ups = ul([_followup_li(f) for f in agenda.get("follow_ups", [])])
+    promises = ul([_promise_li(p) for p in agenda.get("promises_made", [])])
     fyi = ul([escape(x) for x in agenda.get("fyi", [])])
 
     body_html = "".join([
@@ -113,14 +127,17 @@ def render_text(agenda: dict[str, Any], week_start: datetime, week_end: datetime
     ]
     for p in agenda.get("priorities", []):
         src = f" ({p['source_subject']})" if p.get("source_subject") else ""
+        link = f"\n      {p['web_link']}" if p.get("web_link") else ""
         lines.append(f"  • [{p.get('urgency', 'medium')}] {p['title']}{src}")
-        lines.append(f"      {p['reason']}")
+        lines.append(f"      {p['reason']}{link}")
 
     lines += ["", "MEETINGS"]
     for m in agenda.get("meetings", []):
         lines.append(f"  • [{m.get('source', '?')}] {m['subject']} — {m['when']} with {m['participants']}")
         if m.get("prep_notes"):
             lines.append(f"      Prep: {m['prep_notes']}")
+        if m.get("web_link"):
+            lines.append(f"      {m['web_link']}")
 
     lines += ["", "ACTION ITEMS"]
     for a in agenda.get("action_items", []):
@@ -130,17 +147,23 @@ def render_text(agenda: dict[str, Any], week_start: datetime, week_end: datetime
             f"  {mark} [{a.get('owner', '?')}, due {a.get('due', '')}, "
             f"{a.get('urgency', 'medium')}, {a.get('status', 'new')}] {a['task']}{src}"
         )
+        if a.get("web_link"):
+            lines.append(f"      {a['web_link']}")
 
     lines += ["", "FOLLOW-UPS"]
     for f in agenda.get("follow_ups", []):
         mark = _STATUS_MARK.get(f.get("status", "new"), "•")
         weeks = f" (open {f['weeks_open']}w)" if f.get("weeks_open") else ""
         lines.append(f"  {mark} {f['thread']} — waiting on {f['counterparty']}: {f['ask']}{weeks}")
+        if f.get("web_link"):
+            lines.append(f"      {f['web_link']}")
 
     if agenda.get("promises_made"):
         lines += ["", "PROMISES MADE"]
         for p in agenda["promises_made"]:
             lines.append(f"  • {p['commitment']} → {p['to']} by {p['by']}")
+            if p.get("web_link"):
+                lines.append(f"      {p['web_link']}")
 
     lines += ["", "FYI"]
     for x in agenda.get("fyi", []):

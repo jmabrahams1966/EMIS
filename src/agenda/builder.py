@@ -45,6 +45,19 @@ class AgendaResult:
     cache_creation_tokens: int
 
 
+def _make_client(*, api_key: str, model: str, aws_region: str):
+    """Return either an Anthropic public-API client or a Bedrock client.
+
+    Model IDs prefixed with ``anthropic.`` or the cross-region inference
+    prefixes (``us.``, ``eu.``, ``apac.``) route through Bedrock. AWS creds
+    come from the standard boto3 chain — environment, profile, or task role.
+    Anything else uses the public Anthropic API with ``api_key``.
+    """
+    if model.startswith(("anthropic.", "us.anthropic.", "eu.anthropic.", "apac.anthropic.")):
+        return anthropic.AnthropicBedrock(aws_region=aws_region)
+    return anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+
+
 def build_agenda(
     *,
     mode: str,
@@ -57,12 +70,14 @@ def build_agenda(
     week_end: datetime,
     api_key: str,
     model: str = "claude-opus-4-7",
+    aws_region: str = "us-east-1",
 ) -> AgendaResult:
     """Generate the agenda for ``mode`` in (monday, wednesday, friday)."""
     if mode not in MODE_NOTES:
         raise ValueError(f"unknown mode: {mode!r}; expected one of {list(MODE_NOTES)}")
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _make_client(api_key=api_key, model=model, aws_region=aws_region)
+    is_bedrock = isinstance(client, anthropic.AnthropicBedrock)
 
     user_content = _render_user_turn(
         mode=mode, threads=threads, sent_messages=sent_messages,
@@ -71,26 +86,59 @@ def build_agenda(
         week_start=week_start, week_end=week_end,
     )
 
-    with client.messages.stream(
-        model=model,
-        max_tokens=8_000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_content}],
-        thinking={"type": "adaptive"},
-        output_config={
+    # 64K gives adaptive thinking room to work without truncating output;
+    # we're already streaming so HTTP timeouts aren't a concern.
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 64_000,
+        "system": SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": user_content}],
+        "thinking": {"type": "adaptive"},
+    }
+    if is_bedrock:
+        # Bedrock doesn't accept output_config.format yet. Force a tool call
+        # with the same schema as input_schema — the agenda comes back as the
+        # tool_use block's input dict.
+        kwargs["tools"] = [{
+            "name": "build_agenda",
+            "description": "Emit the structured agenda for the week.",
+            "input_schema": AGENDA_SCHEMA,
+        }]
+        kwargs["tool_choice"] = {"type": "tool", "name": "build_agenda"}
+    else:
+        kwargs["output_config"] = {
             "format": {"type": "json_schema", "schema": AGENDA_SCHEMA},
             "effort": "high",
-        },
-    ) as stream:
+        }
+
+    with client.messages.stream(**kwargs) as stream:
         message = stream.get_final_message()
 
-    text_block = next((b for b in message.content if b.type == "text"), None)
-    if text_block is None:
-        raise RuntimeError("Claude returned no text block for the agenda")
-    try:
-        agenda = json.loads(text_block.text)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Claude returned invalid JSON: {exc}") from exc
+    if is_bedrock:
+        tool_block = next(
+            (b for b in message.content if b.type == "tool_use" and b.name == "build_agenda"),
+            None,
+        )
+        if tool_block is None:
+            raise RuntimeError(
+                f"Bedrock returned no build_agenda tool_use block "
+                f"(stop_reason={message.stop_reason})"
+            )
+        # tool_block.input is already a parsed dict matching AGENDA_SCHEMA
+        agenda = tool_block.input
+    else:
+        text_block = next((b for b in message.content if b.type == "text"), None)
+        if text_block is None:
+            raise RuntimeError("Claude returned no text block for the agenda")
+        try:
+            agenda = json.loads(text_block.text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Claude returned invalid JSON "
+                f"(stop_reason={message.stop_reason}, "
+                f"output_tokens={message.usage.output_tokens}, "
+                f"max_tokens=64000): {exc}"
+            ) from exc
 
     usage = message.usage
     logger.info(
@@ -101,8 +149,11 @@ def build_agenda(
         message.stop_reason,
     )
 
+    # raw_text is useful for logging/debugging — for tool_use we serialize
+    # the parsed input back to JSON; for text blocks we keep what came back.
+    raw_text = json.dumps(agenda) if is_bedrock else text_block.text
     return AgendaResult(
-        agenda=agenda, raw_text=text_block.text,
+        agenda=agenda, raw_text=raw_text,
         input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
         cache_read_tokens=usage.cache_read_input_tokens or 0,
         cache_creation_tokens=usage.cache_creation_input_tokens or 0,
@@ -171,6 +222,8 @@ def _render_calendar(events: list[CalendarEvent], max_chars: int = MAX_CALENDAR_
             block.append(f"    Attendees: {attendees}")
         if ev.location:
             block.append(f"  Location: {ev.location}")
+        if ev.web_link:
+            block.append(f"    web: {ev.web_link}")
         block_text = "\n".join(block)
         if used + len(block_text) + 1 > max_chars:
             dropped = len(events) - idx
@@ -193,10 +246,12 @@ def _render_sent(messages: list[Message], max_chars: int = MAX_SENT_CHARS) -> st
         body = (m.body_text or m.preview or "").strip().replace("\n", " ")
         if len(body) > 400:
             body = body[:400] + "…"
+        link_line = f"web: {m.web_link}\n" if m.web_link else ""
         block = (
             f"\n--- TO {', '.join(m.to_recipients)[:120]} ---\n"
             f"Subject: {m.subject}\n"
             f"Sent: {m.received_at.isoformat()}\n"
+            f"{link_line}"
             f"{body}"
         )
         if used + len(block) > max_chars:
@@ -212,6 +267,9 @@ def _render_sent(messages: list[Message], max_chars: int = MAX_SENT_CHARS) -> st
 
 def _render_thread(t: Thread, attachment_texts: dict[str, list[tuple[str, str]]]) -> str:
     flag = " [VIP]" if t.is_vip else ""
+    # Use the most recent message's webLink as the canonical thread link —
+    # Outlook resolves any message in the conversation to the thread view.
+    thread_link = t.messages[-1].web_link if t.messages else ""
     head = [
         f"\n--- THREAD {t.conversation_id[-16:]}{flag} ---",
         f"Subject: {t.subject}",
@@ -220,6 +278,8 @@ def _render_thread(t: Thread, attachment_texts: dict[str, list[tuple[str, str]]]
         f"Messages: {len(t.messages)}  "
         f"Latest: {t.latest_received.isoformat() if t.latest_received else '?'}",
     ]
+    if thread_link:
+        head.append(f"web: {thread_link}")
     lines = ["\n".join(head)]
     for msg in t.messages:
         body = (msg.body_text or msg.preview or "").strip()

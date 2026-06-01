@@ -94,6 +94,15 @@ Resources:
               Resource:
                 - !GetAtt StateBucket.Arn
                 - !Sub ${StateBucket.Arn}/*
+            - Effect: Allow
+              # Bedrock invocation — only required when ANTHROPIC_MODEL is a
+              # Bedrock-prefixed ID (anthropic.* or us.anthropic.*). Scoped to
+              # the Anthropic model family; safe to leave attached when on the
+              # public Anthropic API too (just unused).
+              Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+              Resource:
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.*
+                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*anthropic.*
       Events:
         Monday:
           Type: Schedule

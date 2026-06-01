@@ -133,6 +133,7 @@ async def _run(mode: str) -> dict[str, Any]:
         week_end=now,
         api_key=cfg.anthropic_api_key,
         model=cfg.anthropic_model,
+        aws_region=cfg.aws_region,
     )
 
     # 9. Persist (was step 9 in the docstring; renders below)

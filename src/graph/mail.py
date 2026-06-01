@@ -52,17 +52,50 @@ def _parse_dt(raw: str) -> datetime:
     return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
+SYSTEM_FOLDER_WELL_KNOWN_NAMES = (
+    # Folders we want to exclude from the broad mailbox scan. SentItems is
+    # excluded here because list_sent_messages_since() handles it separately
+    # for promises-made tracking; Drafts/Outbox/Junk/Deleted should never feed
+    # the agenda.
+    "drafts", "sentitems", "deleteditems", "junkemail", "outbox",
+)
+
+
+async def _get_excluded_folder_ids(*, access_token: str) -> set[str]:
+    """Fetch IDs for the system folders we never want to scan into the agenda."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    ids: set[str] = set()
+    async with httpx.AsyncClient(timeout=30) as client:
+        for name in SYSTEM_FOLDER_WELL_KNOWN_NAMES:
+            try:
+                resp = await client.get(
+                    f"{GRAPH_BASE}/me/mailFolders/{name}",
+                    headers=headers, params={"$select": "id"},
+                )
+                if resp.status_code == 200:
+                    ids.add(resp.json()["id"])
+                else:
+                    logger.debug("system folder %s lookup returned %d", name, resp.status_code)
+            except Exception as exc:
+                logger.debug("system folder %s lookup failed: %s", name, exc)
+    return ids
+
+
 async def list_messages_since(
     *,
     access_token: str,
     since: datetime,
-    max_messages: int = 400,
+    max_messages: int = 1000,
 ) -> list[Message]:
-    """Pull mailbox messages received >= ``since``, newest first.
+    """Pull mailbox messages from across all folders received >= ``since``.
 
-    Returns up to ``max_messages`` messages. Folder = Inbox by default; switch
-    to ``/me/messages`` if you want all folders.
+    Scans the entire mailbox (Inbox + Archive + custom folders + subfolders)
+    so threads that have already been filed still feed the agenda. Excludes
+    Drafts, SentItems, DeletedItems, JunkEmail, and Outbox by parentFolderId.
+    Returns up to ``max_messages`` messages, newest first.
     """
+    excluded = await _get_excluded_folder_ids(access_token=access_token)
+
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Prefer": 'outlook.body-content-type="text"',
@@ -73,18 +106,23 @@ async def list_messages_since(
         "$orderby": "receivedDateTime desc",
         "$select": (
             "id,subject,from,toRecipients,ccRecipients,receivedDateTime,"
-            "bodyPreview,body,hasAttachments,importance,isRead,webLink,conversationId"
+            "bodyPreview,body,hasAttachments,importance,isRead,webLink,"
+            "conversationId,parentFolderId"
         ),
     }
-    url = f"{GRAPH_BASE}/me/mailFolders/Inbox/messages"
+    url = f"{GRAPH_BASE}/me/messages"
 
     out: list[Message] = []
+    excluded_count = 0
     async with httpx.AsyncClient(timeout=60) as client:
         while url and len(out) < max_messages:
             resp = await client.get(url, headers=headers, params=params if "$filter" in (params or {}) else None)
             resp.raise_for_status()
             payload = resp.json()
             for item in payload.get("value", []):
+                if item.get("parentFolderId") in excluded:
+                    excluded_count += 1
+                    continue
                 msg = _to_message(item)
                 out.append(msg)
                 if len(out) >= max_messages:
@@ -92,7 +130,10 @@ async def list_messages_since(
             url = payload.get("@odata.nextLink")
             params = None  # nextLink already encodes them
 
-    logger.info("Fetched %d messages since %s", len(out), since.isoformat())
+    logger.info(
+        "Fetched %d messages across folders since %s (excluded %d from system folders)",
+        len(out), since.isoformat(), excluded_count,
+    )
     return out
 
 

@@ -5,6 +5,10 @@ from datetime import datetime
 from typing import Any
 
 
+def _md_link(text: str, url: str) -> str:
+    return f"[{text}]({url})" if url else text
+
+
 def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mode: str) -> str:
     out: list[str] = []
     title = {
@@ -20,7 +24,8 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
 
     out.append("## Priorities")
     for p in agenda.get("priorities", []):
-        bullet = f"- **{p.get('title', '')}** ({p.get('urgency', 'medium')})"
+        title = _md_link(f"**{p.get('title', '')}**", p.get("web_link", ""))
+        bullet = f"- {title} ({p.get('urgency', 'medium')})"
         if p.get("source_subject"):
             bullet += f" — *{p['source_subject']}*"
         out.append(bullet)
@@ -32,8 +37,9 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
     if not agenda.get("meetings"):
         out.append("_(none)_")
     for m in agenda.get("meetings", []):
+        title = _md_link(f"**{m.get('subject', '')}**", m.get("web_link", ""))
         src = f" [{m.get('source', '?')}]"
-        out.append(f"- **{m.get('subject', '')}**{src} — {m.get('when', '')} with {m.get('participants', '')}")
+        out.append(f"- {title}{src} — {m.get('when', '')} with {m.get('participants', '')}")
         if m.get("prep_notes"):
             out.append(f"    - Prep: {m['prep_notes']}")
     out.append("")
@@ -46,8 +52,9 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
         owner = a.get("owner", "?")
         src = f" — *{a['source_subject']}*" if a.get("source_subject") else ""
         marker = {"new": "•", "carried_over": "↻", "resolved": "✓", "stale": "⚠"}.get(status, "•")
+        title = _md_link(f"**{a.get('task', '')}**", a.get("web_link", ""))
         out.append(
-            f"- {marker} **{a.get('task', '')}** [{owner}, due {due}, {urgency}, {status}]{src}"
+            f"- {marker} {title} [{owner}, due {due}, {urgency}, {status}]{src}"
         )
     out.append("")
 
@@ -57,8 +64,9 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
         marker = {"new": "•", "carried_over": "↻", "resolved": "✓", "stale": "⚠"}.get(status, "•")
         weeks = f.get("weeks_open", 0)
         weeks_txt = f" — open {weeks}w" if weeks else ""
+        title = _md_link(f"**{f.get('thread', '')}**", f.get("web_link", ""))
         out.append(
-            f"- {marker} **{f.get('thread', '')}** — *{f.get('counterparty', '')}*: "
+            f"- {marker} {title} — *{f.get('counterparty', '')}*: "
             f"{f.get('ask', '')} ({status}{weeks_txt})"
         )
     out.append("")
@@ -66,7 +74,8 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
     if agenda.get("promises_made"):
         out.append("## Promises you made")
         for p in agenda["promises_made"]:
-            out.append(f"- **{p.get('commitment', '')}** to {p.get('to', '')} by {p.get('by', '')}")
+            title = _md_link(f"**{p.get('commitment', '')}**", p.get("web_link", ""))
+            out.append(f"- {title} to {p.get('to', '')} by {p.get('by', '')}")
         out.append("")
 
     out.append("## FYI")

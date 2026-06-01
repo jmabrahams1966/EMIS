@@ -36,9 +36,9 @@ def _para(pdf: FPDF, text: str, size: int = 11) -> None:
     pdf.ln(2)
 
 
-def _bullet(pdf: FPDF, head: str, sub: str = "") -> None:
+def _bullet(pdf: FPDF, head: str, sub: str = "", link: str = "") -> None:
     pdf.set_font("Helvetica", "B", 10)
-    pdf.multi_cell(_PAGE_W, 5, f"•  {head}")
+    pdf.multi_cell(_PAGE_W, 5, f"•  {head}", link=link or "")
     if sub:
         pdf.set_font("Helvetica", "", 10)
         pdf.set_x(pdf.get_x() + 6)
@@ -74,7 +74,7 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
         sub = p.get("reason", "")
         if p.get("source_subject"):
             sub += f"   (source: {p['source_subject']})"
-        _bullet(pdf, head, sub)
+        _bullet(pdf, head, sub, link=p.get("web_link", ""))
 
     _heading(pdf, "Meetings")
     if not agenda.get("meetings"):
@@ -85,7 +85,7 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
                      f"Source: {m.get('source', '?')}"]
         if m.get("prep_notes"):
             sub_lines.append(f"Prep: {m['prep_notes']}")
-        _bullet(pdf, head, "\n".join(sub_lines))
+        _bullet(pdf, head, "\n".join(sub_lines), link=m.get("web_link", ""))
 
     _heading(pdf, "Action items")
     for a in agenda.get("action_items", []):
@@ -93,7 +93,7 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
                 f"[{a.get('owner', '?')}, due {a.get('due', '')}, "
                 f"{a.get('urgency', 'medium')}, {a.get('status', 'new')}]")
         sub = f"Source: {a['source_subject']}" if a.get("source_subject") else ""
-        _bullet(pdf, head, sub)
+        _bullet(pdf, head, sub, link=a.get("web_link", ""))
 
     _heading(pdf, "Follow-ups")
     for f in agenda.get("follow_ups", []):
@@ -101,7 +101,7 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
         weeks = f.get("weeks_open", 0)
         weeks_txt = f", open {weeks}w" if weeks else ""
         sub = f"{f.get('ask', '')}   ({f.get('status', 'new')}{weeks_txt})"
-        _bullet(pdf, head, sub)
+        _bullet(pdf, head, sub, link=f.get("web_link", ""))
 
     if agenda.get("promises_made"):
         _heading(pdf, "Promises you made")
@@ -110,7 +110,7 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
             sub = f"To {p.get('to', '')} by {p.get('by', '')}"
             if p.get("source_subject"):
                 sub += f"   (source: {p['source_subject']})"
-            _bullet(pdf, head, sub)
+            _bullet(pdf, head, sub, link=p.get("web_link", ""))
 
     _heading(pdf, "FYI")
     for x in agenda.get("fyi", []):

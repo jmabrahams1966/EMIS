@@ -65,6 +65,14 @@ Quality bar:
 - Reference the source message subject in parentheses when an item isn't \
   self-explanatory.
 - Use plain text in string fields. No markdown.
+
+Linking back to the source:
+- Every item that ties to a single source — priorities, meetings, action items, \
+  follow-ups, promises — has a `web_link` field. Populate it with the URL \
+  shown next to the source in this turn (the `web:` line on a thread, \
+  calendar event, or sent message). Copy the URL verbatim. If the item \
+  draws from multiple sources or no single source is identifiable, leave \
+  `web_link` as an empty string. Do not invent URLs.
 """
 
 
@@ -117,8 +125,12 @@ AGENDA_SCHEMA = {
                         "type": "string",
                         "enum": ["high", "medium", "low"],
                     },
+                    "web_link": {
+                        "type": "string",
+                        "description": "URL of the source thread/event, '' if unknown.",
+                    },
                 },
-                "required": ["title", "reason", "source_subject", "urgency"],
+                "required": ["title", "reason", "source_subject", "urgency", "web_link"],
                 "additionalProperties": False,
             },
         },
@@ -139,8 +151,12 @@ AGENDA_SCHEMA = {
                         "type": "string",
                         "enum": ["calendar", "email"],
                     },
+                    "web_link": {
+                        "type": "string",
+                        "description": "URL of the calendar event or source email, '' if unknown.",
+                    },
                 },
-                "required": ["subject", "when", "participants", "prep_notes", "source"],
+                "required": ["subject", "when", "participants", "prep_notes", "source", "web_link"],
                 "additionalProperties": False,
             },
         },
@@ -169,10 +185,14 @@ AGENDA_SCHEMA = {
                         "type": "string",
                         "enum": ["new", "carried_over", "resolved", "stale"],
                     },
+                    "web_link": {
+                        "type": "string",
+                        "description": "URL of the source thread, '' if unknown.",
+                    },
                 },
                 "required": [
                     "task", "owner", "due", "due_date", "urgency",
-                    "source_subject", "status",
+                    "source_subject", "status", "web_link",
                 ],
                 "additionalProperties": False,
             },
@@ -194,8 +214,12 @@ AGENDA_SCHEMA = {
                         "type": "integer",
                         "description": "Best-effort count of weeks this has been open.",
                     },
+                    "web_link": {
+                        "type": "string",
+                        "description": "URL of the source thread, '' if unknown.",
+                    },
                 },
-                "required": ["thread", "counterparty", "ask", "status", "weeks_open"],
+                "required": ["thread", "counterparty", "ask", "status", "weeks_open", "web_link"],
                 "additionalProperties": False,
             },
         },
@@ -212,8 +236,12 @@ AGENDA_SCHEMA = {
                     "to": {"type": "string"},
                     "by": {"type": "string"},
                     "source_subject": {"type": "string"},
+                    "web_link": {
+                        "type": "string",
+                        "description": "URL of the sent message, '' if unknown.",
+                    },
                 },
-                "required": ["commitment", "to", "by", "source_subject"],
+                "required": ["commitment", "to", "by", "source_subject", "web_link"],
                 "additionalProperties": False,
             },
         },
