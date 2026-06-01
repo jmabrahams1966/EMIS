@@ -17,7 +17,7 @@ Parameters:
     Default: emis/anthropic
   AnthropicModel:
     Type: String
-    Default: claude-opus-4-8
+    Default: claude-opus-4-7
   TodoListName:
     Type: String
     Default: EMIS

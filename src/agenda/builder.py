@@ -56,7 +56,7 @@ def build_agenda(
     week_start: datetime,
     week_end: datetime,
     api_key: str,
-    model: str = "claude-opus-4-8",
+    model: str = "claude-opus-4-7",
 ) -> AgendaResult:
     """Generate the agenda for ``mode`` in (monday, wednesday, friday)."""
     if mode not in MODE_NOTES:

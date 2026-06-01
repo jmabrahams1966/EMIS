@@ -23,7 +23,7 @@ class Config:
     anthropic_api_key: str
 
     # Knobs
-    anthropic_model: str = "claude-opus-4-8"
+    anthropic_model: str = "claude-opus-4-7"
     agenda_sender: str = ""
     agenda_recipient: str = ""
     state_bucket: str = ""
@@ -61,7 +61,7 @@ def load_config() -> Config:
             graph_tenant_id=os.getenv("GRAPH_TENANT_ID", "common"),
             graph_refresh_token=os.environ["GRAPH_REFRESH_TOKEN"],
             anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
-            anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8"),
+            anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-opus-4-7"),
             agenda_sender=os.getenv("AGENDA_SENDER", ""),
             agenda_recipient=os.getenv("AGENDA_RECIPIENT", ""),
             state_bucket=os.getenv("STATE_BUCKET", ""),
@@ -82,7 +82,7 @@ def load_config() -> Config:
         graph_tenant_id=graph.get("tenant_id", "common"),
         graph_refresh_token=graph["refresh_token"],
         anthropic_api_key=anthropic["api_key"],
-        anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8"),
+        anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-opus-4-7"),
         agenda_sender=os.environ["AGENDA_SENDER"],
         agenda_recipient=os.environ["AGENDA_RECIPIENT"],
         state_bucket=os.environ["STATE_BUCKET"],

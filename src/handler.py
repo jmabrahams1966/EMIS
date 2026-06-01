@@ -72,6 +72,9 @@ async def _run(mode: str) -> dict[str, Any]:
         graph_auth.rotate_refresh_token_secret(
             os.environ["GRAPH_SECRET_ID"], tokens.refresh_token
         )
+        # Keep the lru_cached Config in sync with Secrets Manager so the next
+        # invocation in this warm container doesn't reuse the stale token.
+        cfg.graph_refresh_token = tokens.refresh_token
 
     # 2. Filters from S3
     vip = load_vip(cfg.state_bucket) if cfg.state_bucket else []
@@ -111,9 +114,10 @@ async def _run(mode: str) -> dict[str, Any]:
         dry_run=cfg.dry_run,
     )
 
-    # 6. Memory
+    # 6. Memory — anchor lookback on `now` so weeks_back=1 is last week,
+    # not two weeks ago (since = now - lookback_days).
     prior = (
-        load_prior_agendas(cfg.state_bucket, since)
+        load_prior_agendas(cfg.state_bucket, now)
         if cfg.state_bucket else []
     )
 
@@ -157,13 +161,18 @@ async def _run(mode: str) -> dict[str, Any]:
         print(text)
         return {"status": "dry_run", "mode": mode, "tokens": _token_dict(result)}
 
-    # 10. Side effects
+    # 10. Side effects — each is best-effort so one failure (e.g. SES sandbox,
+    # OneDrive 5xx) doesn't block the rest.
     side_effects: dict[str, Any] = {}
 
-    side_effects["ses"] = send_via_ses(
-        sender=cfg.agenda_sender, recipient=cfg.agenda_recipient,
-        subject=subject, html=html, text=text,
-    ).get("MessageId")
+    try:
+        side_effects["ses"] = send_via_ses(
+            sender=cfg.agenda_sender, recipient=cfg.agenda_recipient,
+            subject=subject, html=html, text=text,
+        ).get("MessageId")
+    except Exception as exc:
+        logger.warning("SES send failed: %s", exc)
+        side_effects["ses"] = {"error": str(exc)}
 
     if cfg.upload_to_onedrive:
         side_effects["onedrive"] = await _upload_to_onedrive(
@@ -180,7 +189,7 @@ async def _run(mode: str) -> dict[str, Any]:
             action_items=[
                 a for a in result.agenda.get("action_items", [])
                 if a.get("status") in ("new", "carried_over")
-                and (a.get("owner", "").lower() == "you" or a.get("owner") == "")
+                and a.get("owner", "").lower() == "you"
             ],
         )
 

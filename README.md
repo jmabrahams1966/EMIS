@@ -20,7 +20,7 @@ Lambda (one function, mode-aware)
   ├─ Thread grouping (by conversationId)
   ├─ Cross-week memory (last 4 weeks of agendas → status: new/carried_over/resolved/stale)
   ├─ Attachment text extraction (PDF / DOCX / XLSX / HTML)
-  ├─ Claude API: opus-4-8 + adaptive thinking + cached system prompt + json_schema output
+  ├─ Claude API: opus-4-7 + adaptive thinking + cached system prompt + json_schema output
   └─ Side effects:
        ├─ SES — emails the agenda
        ├─ Microsoft To Do — creates one task per action item (deduped)
@@ -84,7 +84,7 @@ week), `resolved` (recently closed — surfaced in `week_summary`), or `stale`
    ```
    You'll be prompted for the sender, recipient, `WebUiToken` (any long random
    string — pick something stronger than `password123`), and Anthropic model id
-   (default: `claude-opus-4-8`).
+   (default: `claude-opus-4-7`).
 
 6. **(Optional)** Edit the VIP and blocklist:
    ```bash
@@ -161,7 +161,7 @@ infrastructure/
   reads it on every run except the first. Cache hits are logged.
 - A typical run is ~30-150K input tokens (inbox + threads + calendar + memory)
   and ~2-5K output. With caching, the recurring marginal cost is well under
-  $1/week on opus-4-8.
+  $1/week on opus-4-7.
 - SES outbound: 1 email per run × 3 runs/week.
 - Lambda: ≤ 15 min per run; small.
 - S3: a few MB per week including attachments. Lifecycle expires after 365d.
