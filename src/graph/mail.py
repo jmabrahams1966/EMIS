@@ -218,6 +218,88 @@ async def list_sent_messages_since(
     return out
 
 
+async def find_message_in_thread(
+    *, access_token: str, thread_subject: str, counterparty: str,
+) -> dict | None:
+    """Best-effort: find a recent message in a thread for a given counterparty.
+
+    Used by the stale-follow-up draft generator to locate the message to
+    reply to. Searches by subject fragment + from-address. Returns the most
+    recent match or None.
+    """
+    if not thread_subject or not counterparty:
+        return None
+    headers = {"Authorization": f"Bearer {access_token}"}
+    # Strip "Re:" / "Fwd:" prefixes for matching.
+    bare_subject = thread_subject
+    for prefix in ("Re:", "RE:", "Fwd:", "FW:"):
+        if bare_subject.startswith(prefix):
+            bare_subject = bare_subject[len(prefix):].strip()
+    # OData $search by subject; can't combine with $filter on parentFolderId
+    # in the same call, so we just do a search-by-subject and pick the most
+    # recent message touching the counterparty.
+    params = {
+        "$top": "10",
+        "$search": f'"{bare_subject[:60]}"',
+        "$select": "id,subject,from,toRecipients,receivedDateTime,conversationId",
+    }
+    url = f"{GRAPH_BASE}/me/messages"
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            resp = await client.get(url, headers=headers, params=params)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.debug("find_message_in_thread failed: %s", exc)
+            return None
+        cp_low = counterparty.lower()
+        for item in resp.json().get("value", []):
+            sender = (item.get("from", {}).get("emailAddress", {}) or {}).get("address", "").lower()
+            recipients = [
+                (r.get("emailAddress") or {}).get("address", "").lower()
+                for r in item.get("toRecipients", []) if r.get("emailAddress")
+            ]
+            if cp_low in sender or any(cp_low in r for r in recipients):
+                return item
+    return None
+
+
+async def create_draft_reply(
+    *, access_token: str, original_message_id: str, body_text: str,
+) -> dict[str, Any]:
+    """Create a draft reply to a Graph message; user opens + sends manually.
+
+    Uses ``/me/messages/{id}/createReply`` which creates a draft including
+    proper threading headers (In-Reply-To, References), then PATCHes the
+    body. The draft lands in the user's Drafts folder for review.
+    """
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Step 1: createReply returns a draft with quoted-text body.
+        resp = await client.post(
+            f"{GRAPH_BASE}/me/messages/{original_message_id}/createReply",
+            headers=headers, json={},
+        )
+        resp.raise_for_status()
+        draft = resp.json()
+        draft_id = draft["id"]
+        # Step 2: prepend our body to the existing quoted-text.
+        existing = (draft.get("body") or {}).get("content", "")
+        new_body = (
+            f"<div>{body_text}</div>"
+            f"<br><br>{existing}"
+        )
+        update = await client.patch(
+            f"{GRAPH_BASE}/me/messages/{draft_id}",
+            headers=headers,
+            json={"body": {"contentType": "HTML", "content": new_body}},
+        )
+        update.raise_for_status()
+        return {"id": draft_id, "web_link": draft.get("webLink", "")}
+
+
 async def fetch_attachments(
     *,
     access_token: str,

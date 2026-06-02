@@ -42,7 +42,11 @@ from .graph import auth as graph_auth
 from .graph import calendar as graph_calendar
 from .graph import onedrive as graph_onedrive
 from .graph import todo as graph_todo
-from .graph.mail import default_since, fetch_attachments, list_messages_since, list_sent_messages_since
+from .graph.mail import (
+    create_draft_reply, default_since, fetch_attachments, find_message_in_thread,
+    list_messages_since, list_sent_messages_since,
+)
+from .nudge_drafts import generate_nudge_bodies
 from .snooze import (
     DoneRecord, active_snoozes, load_closures, prune_closures, save_closures,
 )
@@ -289,6 +293,51 @@ async def _run(mode: str) -> dict[str, Any]:
                 and a.get("owner", "").lower() == "you"
             ],
         )
+
+    if mode == "monday":
+        # Auto-draft polite nudge replies for stale follow-ups so the user
+        # can send with one click later. Stale = weeks_open >= 2 and not
+        # resolved. Best-effort; failures don't block the rest.
+        stale = [
+            f for f in result.agenda.get("follow_ups", [])
+            if f.get("weeks_open", 0) >= 2
+            and f.get("status") != "resolved"
+            and f.get("counterparty") and f.get("thread")
+        ]
+        if stale:
+            try:
+                bodies = generate_nudge_bodies(
+                    follow_ups=stale,
+                    api_key=cfg.anthropic_api_key,
+                    model=cfg.anthropic_model,
+                    aws_region=cfg.aws_region,
+                )
+                drafts_created = 0
+                for f in stale:
+                    body = bodies.get(f.get("thread", ""))
+                    if not body:
+                        continue
+                    src = await find_message_in_thread(
+                        access_token=tokens.access_token,
+                        thread_subject=f.get("thread", ""),
+                        counterparty=f.get("counterparty", ""),
+                    )
+                    if not src:
+                        continue
+                    try:
+                        await create_draft_reply(
+                            access_token=tokens.access_token,
+                            original_message_id=src["id"],
+                            body_text=body,
+                        )
+                        drafts_created += 1
+                    except Exception as exc:
+                        logger.warning("nudge draft creation failed: %s", exc)
+                side_effects["nudge_drafts"] = drafts_created
+                logger.info("nudge drafts created: %d", drafts_created)
+            except Exception as exc:
+                logger.warning("nudge body generation failed: %s", exc)
+                side_effects["nudge_drafts"] = {"error": str(exc)}
 
     if cfg.create_calendar_event and mode == "monday":
         try:
