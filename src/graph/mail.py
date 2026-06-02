@@ -100,9 +100,16 @@ async def list_messages_since(
         "Authorization": f"Bearer {access_token}",
         "Prefer": 'outlook.body-content-type="text"',
     }
+    # Push the system-folder exclusion server-side so Graph doesn't return
+    # ~5x as many messages (most of a typical mailbox lives in Sent / Junk /
+    # Deleted). Multiple parentFolderId clauses combined with `and` is the
+    # only portable way to express "not in {ids}" — OData has no IN op.
+    filter_clauses = [f"receivedDateTime ge {_iso(since)}"]
+    for fid in sorted(excluded):
+        filter_clauses.append(f"parentFolderId ne '{fid}'")
     params = {
         "$top": "100",
-        "$filter": f"receivedDateTime ge {_iso(since)}",
+        "$filter": " and ".join(filter_clauses),
         "$orderby": "receivedDateTime desc",
         "$select": (
             "id,subject,from,toRecipients,ccRecipients,receivedDateTime,"
@@ -113,26 +120,26 @@ async def list_messages_since(
     url = f"{GRAPH_BASE}/me/messages"
 
     out: list[Message] = []
-    excluded_count = 0
     async with httpx.AsyncClient(timeout=60) as client:
         while url and len(out) < max_messages:
             resp = await client.get(url, headers=headers, params=params if "$filter" in (params or {}) else None)
             resp.raise_for_status()
             payload = resp.json()
             for item in payload.get("value", []):
+                # Belt-and-suspenders: still drop anything in excluded folders
+                # in case Graph returned it (some tenants ignore $filter on
+                # parentFolderId for shared folders).
                 if item.get("parentFolderId") in excluded:
-                    excluded_count += 1
                     continue
-                msg = _to_message(item)
-                out.append(msg)
+                out.append(_to_message(item))
                 if len(out) >= max_messages:
                     break
             url = payload.get("@odata.nextLink")
-            params = None  # nextLink already encodes them
+            params = None
 
     logger.info(
-        "Fetched %d messages across folders since %s (excluded %d from system folders)",
-        len(out), since.isoformat(), excluded_count,
+        "Fetched %d messages across folders since %s",
+        len(out), since.isoformat(),
     )
     return out
 

@@ -47,6 +47,7 @@ from .snooze import (
     DoneRecord, active_snoozes, load_closures, prune_closures, save_closures,
 )
 from .state import store
+from .telemetry import load_runs, record_run, render_telemetry_html, summarize_last_n_days
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -191,10 +192,32 @@ async def _run(mode: str) -> dict[str, Any]:
         store.save_agenda(cfg.state_bucket, since, mode, result.agenda)
 
     # 8. Render
+    # Record this run's cost. Telemetry is best-effort — never blocks the
+    # main pipeline.
+    try:
+        record_run(
+            bucket=cfg.state_bucket, mode=mode,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            now=now,
+        )
+    except Exception as exc:
+        logger.warning("telemetry record failed: %s", exc)
+
     html = render_html(
         result.agenda, since, now, mode=mode,
         web_ui_url=cfg.web_ui_url, web_ui_token=cfg.web_ui_token,
     )
+    # On Friday, append a 7-day health summary to the email so the user gets
+    # a recurring sense of cost trajectory + error count.
+    if mode == "friday" and cfg.state_bucket:
+        try:
+            summary = summarize_last_n_days(load_runs(cfg.state_bucket), days=7, now=now)
+            footer = render_telemetry_html(summary)
+            if footer:
+                html = html.replace("</body></html>", f"{footer}</body></html>")
+        except Exception as exc:
+            logger.warning("telemetry summary failed: %s", exc)
     text = render_text(result.agenda, since, now, mode=mode)
     md_text = md_export.render(result.agenda, since, now, mode=mode)
     try:
@@ -349,6 +372,16 @@ async def _run_briefs() -> dict[str, Any]:
         model=cfg.anthropic_model,
         aws_region=cfg.aws_region,
     )
+
+    try:
+        record_run(
+            bucket=cfg.state_bucket, mode="morning",
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            now=now,
+        )
+    except Exception as exc:
+        logger.warning("telemetry record failed: %s", exc)
 
     # 6. Render
     html = render_briefs_html(
