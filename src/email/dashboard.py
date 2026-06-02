@@ -264,7 +264,7 @@ def _render_actions_panel(agenda: dict) -> str:
             if a.get("source_subject") else ""
         )
         rows.append(
-            f"<li style='margin-bottom:8px'>{_status_badge(a.get('status', 'new'))}{title}"
+            f"<li style='margin-bottom:8px'>{title}"
             f"{_add_to_cal_button(a)}"
             f"<ul style='margin:2px 0 0 0;padding-left:18px;color:#666;font-size:12px'>"
             f"<li>{meta}{src}</li></ul></li>"
@@ -279,13 +279,16 @@ def _render_followups_panel(agenda: dict) -> str:
     rows = []
     for f in items:
         title = _linked(f"<strong>{escape(f['thread'])}</strong>", f.get("web_link", ""))
-        weeks = (
-            f" <span style='color:#888'>(open {f['weeks_open']}w)</span>"
-            if f.get("weeks_open") else ""
-        )
+        meta_bits = [
+            f"waiting on {escape(f['counterparty'])}",
+            escape(f.get("status", "new")),
+            f"open {f['weeks_open']}w" if f.get("weeks_open") else "",
+        ]
+        meta = " · ".join(b for b in meta_bits if b)
         rows.append(
-            f"<li style='margin-bottom:8px'>{_status_badge(f.get('status', 'new'))}{title} — "
-            f"waiting on {escape(f['counterparty'])}: {escape(f['ask'])}{weeks}</li>"
+            f"<li style='margin-bottom:8px'>{title} — {escape(f['ask'])}"
+            f"<ul style='margin:2px 0 0 0;padding-left:18px;color:#666;font-size:12px'>"
+            f"<li>{meta}</li></ul></li>"
         )
     return f"<ul style='line-height:1.6'>{''.join(rows)}</ul>"
 
