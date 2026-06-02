@@ -43,7 +43,9 @@ from .graph import calendar as graph_calendar
 from .graph import onedrive as graph_onedrive
 from .graph import todo as graph_todo
 from .graph.mail import default_since, fetch_attachments, list_messages_since, list_sent_messages_since
-from .snooze import active_snoozes, load_snoozes
+from .snooze import (
+    DoneRecord, active_snoozes, load_closures, prune_closures, save_closures,
+)
 from .state import store
 
 logging.basicConfig(
@@ -126,11 +128,45 @@ async def _run(mode: str) -> dict[str, Any]:
         if cfg.state_bucket else []
     )
 
-    # 6b. Snoozes — only the still-active ones get passed to the prompt.
-    snoozes_active = (
-        [s.to_dict() for s in active_snoozes(load_snoozes(cfg.state_bucket), now)]
-        if cfg.state_bucket else []
-    )
+    # 6b. Closures — load existing state, two-way sync from Microsoft To Do,
+    # prune very-old records, then pass the active set to the agenda prompt.
+    closures = prune_closures(load_closures(cfg.state_bucket), now)
+    if cfg.create_todo_tasks and cfg.state_bucket:
+        try:
+            todo_list_id = await graph_todo.ensure_list(
+                tokens.access_token, cfg.todo_list_name,
+            )
+            existing_todo_ids = {d.source_id for d in closures.done if d.source == "todo_sync"}
+            completed = await graph_todo.list_completed_tasks(
+                tokens.access_token, todo_list_id,
+            )
+            ts = now.isoformat()
+            new_count = 0
+            for task in completed:
+                tid = task["id"]
+                if tid in existing_todo_ids:
+                    continue
+                completed_at = (task.get("completedDateTime") or {}).get("dateTime") or ts
+                closures.done.append(DoneRecord(
+                    item_match=task.get("title", ""),
+                    completed_at=completed_at,
+                    source="todo_sync",
+                    source_id=tid,
+                ))
+                new_count += 1
+            if new_count:
+                logger.info("synced %d completed To Do tasks into closures", new_count)
+        except Exception as exc:
+            logger.warning("To Do completion sync failed: %s", exc)
+
+    if cfg.state_bucket and not cfg.dry_run:
+        save_closures(cfg.state_bucket, closures)
+
+    closures_for_prompt = {
+        "snoozes": [s.to_dict() for s in active_snoozes(closures, now)],
+        "done": [d.to_dict() for d in closures.done],
+        "drops": [d.to_dict() for d in closures.drops],
+    }
 
     # 7. Build the agenda
     result = build_agenda(
@@ -145,7 +181,7 @@ async def _run(mode: str) -> dict[str, Any]:
         api_key=cfg.anthropic_api_key,
         model=cfg.anthropic_model,
         aws_region=cfg.aws_region,
-        snoozes=snoozes_active,
+        closures=closures_for_prompt,
     )
 
     # 9. Persist (was step 9 in the docstring; renders below)
@@ -171,7 +207,15 @@ async def _run(mode: str) -> dict[str, Any]:
     subject = _email_subject(mode, now)
 
     if cfg.dry_run:
-        dashboard_html = render_dashboard_html(result.agenda, since, now, mode=mode)
+        dashboard_html = render_dashboard_html(
+            result.agenda, since, now, mode=mode,
+            closures={
+                "snoozes": [s.to_dict() for s in closures.snoozes],
+                "done": [d.to_dict() for d in closures.done],
+                "drops": [d.to_dict() for d in closures.drops],
+            },
+            prior_agendas=prior,
+        )
         previews = _write_previews(
             name=f"agenda.{mode}",
             html=html, text=text, md=md_text, pdf_bytes=pdf_bytes,

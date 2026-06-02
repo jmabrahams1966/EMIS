@@ -33,7 +33,9 @@ from urllib.parse import urlencode
 
 import boto3
 
+from .agenda.memory import load_prior_agendas
 from .email.dashboard import render_dashboard_html
+from .snooze import load_closures
 from .state import store
 
 logger = logging.getLogger("emis.web_ui")
@@ -163,9 +165,26 @@ def _render_agenda_page(bucket: str, week: str, mode: str, agenda: dict, token: 
         week_end = datetime.fromisocalendar(int(year), int(w), 7)
     except Exception:
         week_start = week_end = datetime.utcnow()
-    # The dashboard is a fully self-contained HTML document — return it
-    # directly without wrapping it in _chrome (which has its own <head>).
-    return render_dashboard_html(agenda, week_start, week_end, mode=mode)
+    # Pull closures + prior agendas so Backlog and History tabs are populated.
+    try:
+        closures = load_closures(bucket)
+        closures_dict = {
+            "snoozes": [s.to_dict() for s in closures.snoozes],
+            "done": [d.to_dict() for d in closures.done],
+            "drops": [d.to_dict() for d in closures.drops],
+        }
+    except Exception as exc:
+        logger.warning("loading closures failed: %s", exc)
+        closures_dict = None
+    try:
+        prior = load_prior_agendas(bucket, week_end)
+    except Exception as exc:
+        logger.warning("loading prior agendas failed: %s", exc)
+        prior = []
+    return render_dashboard_html(
+        agenda, week_start, week_end, mode=mode,
+        closures=closures_dict, prior_agendas=prior,
+    )
 
 
 def _modes_for_week(s3, bucket: str, week: str) -> list[str]:

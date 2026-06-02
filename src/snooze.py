@@ -1,18 +1,22 @@
 """Reply-to-EMIS command handler.
 
-Runs as a separate Lambda every 30 minutes. Polls the user's inbox for
-unread replies to the agenda email, parses each via Claude into structured
-snooze records, persists them to S3, and marks the email read so we don't
-re-process.
+Polls the user's inbox every 30 minutes for unread replies to the agenda
+email, parses each body via Claude into structured closure records, and
+persists them to ``s3://<bucket>/state/closures.json``. The agenda builder
+reads these on the next run and respects them.
 
-Snoozes are written to ``s3://{bucket}/state/snoozes.json`` as a single
-accumulating list. ``builder.py`` reads them on the next agenda run and
-includes them in the user turn as context — the system prompt tells Claude
-to suppress snoozed items from priorities/action_items/follow_ups until
-their ``until`` date has passed.
+Three closure verbs supported:
 
-MVP vocabulary: snooze only. Future versions can add drop / done /
-delegate.
+- ``snooze``: hide the item until ``until_iso``; resurfaces once the date
+  passes.
+- ``done``: mark as completed. The agenda treats incoming threads about
+  this item as ``resolved`` (a closure signal) rather than
+  ``carried_over``. Also appears in the dashboard's History tab.
+- ``drop``: permanently suppress. Never surfaces again. No History entry.
+
+The polling Lambda is invoked by EventBridge (`SnoozePollSchedule`) but the
+naming has stuck for backward compat; functionally it handles all three
+verbs.
 """
 from __future__ import annotations
 
@@ -20,7 +24,7 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -33,139 +37,184 @@ from .agenda.builder import _make_client
 from .config import load_config
 from .graph import auth as graph_auth
 
-logger = logging.getLogger("emis.snooze")
+logger = logging.getLogger("emis.closures")
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-
-# Look back this far for replies. EventBridge runs every 30 min; 24h is
-# generous slack to catch replies during overnight outages.
 REPLY_LOOKBACK_HOURS = 24
-
-# Snooze records older than this with their `until` date in the past are
-# pruned on each run to keep the file small.
+# Snoozes whose until date is past + this much get pruned. Done/drop records
+# are retained longer (see DONE_RETAIN_DAYS) since they feed the History tab.
 SNOOZE_EXPIRY_DAYS = 90
+DONE_RETAIN_DAYS = 730  # ~2 years of completion history
+DROP_RETAIN_DAYS = 365
 
 
-SNOOZE_PARSER_SYSTEM = """\
-You parse a user's plain-English email reply into structured snooze commands.
+CLOSURES_PARSER_SYSTEM = """\
+You parse a user's plain-English email reply into structured closure \
+commands. The user receives weekly or daily agenda emails and replies with \
+informal instructions like:
 
-The user receives a weekly or daily agenda email and replies with informal \
-instructions like "snooze the Costco thread until Monday" or "snooze \
-horizon decision for 2 weeks". Convert each instruction into a JSON object \
-with these fields:
+- "snooze the Costco thread until Monday"
+- "done with the malpractice premium"
+- "drop the FYI about the all-hands meeting"
+- "Already paid Rising Fastball" (this is a done command)
 
-- item_match: a short string identifying which agenda item the user means. \
-  Quote the most distinctive words verbatim from their reply — usually a \
-  thread subject fragment, person's name, vendor, or topic. Don't \
-  paraphrase or expand.
-- until_iso: the ISO date (YYYY-MM-DD) the snooze expires. Resolve relative \
-  expressions ("next Monday", "in 2 weeks", "until Friday") against \
-  today's date provided in the user turn. Default to one week if the user \
-  doesn't specify a duration.
+Three actions are supported:
 
-Only output snooze commands. Ignore other instructions (drop, done, \
-delegate) — those aren't supported yet. If you find no valid snooze \
-commands, return an empty list.
+- ``snooze``: defer until a specific date. Fill ``until_iso`` with the ISO \
+  date the snooze expires. Resolve relative phrases ("next Monday", "for 2 \
+  weeks") against today's date in the user turn. Default to one week if no \
+  duration given.
+- ``done``: the user has completed (or confirmed handled) the item. Leave \
+  ``until_iso`` empty. "Did", "done", "finished", "handled", "paid", \
+  "sent", "called", "scheduled", "confirmed" are all done signals.
+- ``drop``: the user wants the item permanently suppressed. Leave \
+  ``until_iso`` empty. "Drop", "skip", "ignore", "not relevant", "don't \
+  care" are drop signals.
 
-Don't invent items — if you can't tell what the user means, skip it.
+For each command, ``item_match`` is a short string identifying the agenda \
+item — quote the most distinctive verbatim words (vendor name, person, \
+amount, thread subject fragment). Don't paraphrase. If you cannot tell \
+which item the user means, skip it entirely.
+
+Only emit valid commands. If the reply has no recognizable closure \
+instructions, return an empty list.
 """
 
 
-SNOOZE_PARSE_SCHEMA = {
+CLOSURES_PARSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "snoozes": {
+        "commands": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
+                    "action": {"type": "string", "enum": ["snooze", "done", "drop"]},
                     "item_match": {"type": "string"},
                     "until_iso": {
                         "type": "string",
-                        "description": "YYYY-MM-DD",
+                        "description": "YYYY-MM-DD for snooze; empty string for done/drop",
                     },
                 },
-                "required": ["item_match", "until_iso"],
+                "required": ["action", "item_match", "until_iso"],
                 "additionalProperties": False,
             },
         },
     },
-    "required": ["snoozes"],
+    "required": ["commands"],
     "additionalProperties": False,
 }
 
 
+# ── Records ────────────────────────────────────────────────────────────────
+
 @dataclass
 class SnoozeRecord:
     item_match: str
-    until_iso: str
-    snoozed_at: str  # ISO timestamp
-    source_message_id: str  # the reply email's Graph ID
+    until_iso: str       # YYYY-MM-DD
+    snoozed_at: str      # ISO timestamp
+    source_message_id: str
 
     def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass
+class DoneRecord:
+    item_match: str
+    completed_at: str    # ISO timestamp
+    source: str          # "reply_command" | "todo_sync"
+    source_id: str       # message id or To Do task id
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass
+class DropRecord:
+    item_match: str
+    dropped_at: str      # ISO timestamp
+    source_message_id: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass
+class Closures:
+    snoozes: list[SnoozeRecord] = field(default_factory=list)
+    done: list[DoneRecord] = field(default_factory=list)
+    drops: list[DropRecord] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, list[dict[str, str]]]:
         return {
-            "item_match": self.item_match,
-            "until_iso": self.until_iso,
-            "snoozed_at": self.snoozed_at,
-            "source_message_id": self.source_message_id,
+            "snoozes": [s.to_dict() for s in self.snoozes],
+            "done": [d.to_dict() for d in self.done],
+            "drops": [d.to_dict() for d in self.drops],
         }
 
 
 # ── S3 state ───────────────────────────────────────────────────────────────
 
-def _snoozes_key() -> str:
-    return "state/snoozes.json"
+def _closures_key() -> str:
+    return "state/closures.json"
 
 
-def load_snoozes(bucket: str) -> list[SnoozeRecord]:
-    """Load all snoozes from S3. Returns empty list if file doesn't exist."""
+def load_closures(bucket: str) -> Closures:
+    """Load all closures from S3. Returns empty Closures if file missing."""
     if not bucket:
-        return []
+        return Closures()
     try:
-        obj = boto3.client("s3").get_object(Bucket=bucket, Key=_snoozes_key())
+        obj = boto3.client("s3").get_object(Bucket=bucket, Key=_closures_key())
         raw = json.loads(obj["Body"].read().decode("utf-8"))
     except ClientError as exc:
         if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
-            return []
+            return Closures()
         raise
-    return [SnoozeRecord(**r) for r in raw]
+    return Closures(
+        snoozes=[SnoozeRecord(**s) for s in raw.get("snoozes", [])],
+        done=[DoneRecord(**d) for d in raw.get("done", [])],
+        drops=[DropRecord(**d) for d in raw.get("drops", [])],
+    )
 
 
-def save_snoozes(bucket: str, snoozes: list[SnoozeRecord]) -> None:
-    data = json.dumps([s.to_dict() for s in snoozes], indent=2)
+def save_closures(bucket: str, closures: Closures) -> None:
+    if not bucket:
+        return
+    data = json.dumps(closures.to_dict(), indent=2)
     boto3.client("s3").put_object(
-        Bucket=bucket, Key=_snoozes_key(),
+        Bucket=bucket, Key=_closures_key(),
         Body=data.encode("utf-8"), ContentType="application/json",
     )
 
 
-def active_snoozes(snoozes: list[SnoozeRecord], now: datetime) -> list[SnoozeRecord]:
-    """Return snoozes whose ``until_iso`` is still in the future."""
+def prune_closures(closures: Closures, now: datetime) -> Closures:
+    """Drop very old records to keep the state file small."""
     today_iso = now.date().isoformat()
-    return [s for s in snoozes if s.until_iso >= today_iso]
+    snooze_cutoff = (now - timedelta(days=SNOOZE_EXPIRY_DAYS)).date().isoformat()
+    done_cutoff = (now - timedelta(days=DONE_RETAIN_DAYS)).isoformat()
+    drop_cutoff = (now - timedelta(days=DROP_RETAIN_DAYS)).isoformat()
+    return Closures(
+        snoozes=[s for s in closures.snoozes if s.until_iso >= snooze_cutoff],
+        done=[d for d in closures.done if d.completed_at >= done_cutoff],
+        drops=[d for d in closures.drops if d.dropped_at >= drop_cutoff],
+    )
 
 
-def prune_expired(snoozes: list[SnoozeRecord], now: datetime) -> list[SnoozeRecord]:
-    """Drop snoozes whose ``until_iso`` is older than SNOOZE_EXPIRY_DAYS."""
-    cutoff = (now - timedelta(days=SNOOZE_EXPIRY_DAYS)).date().isoformat()
-    return [s for s in snoozes if s.until_iso >= cutoff]
+def active_snoozes(closures: Closures, now: datetime) -> list[SnoozeRecord]:
+    today_iso = now.date().isoformat()
+    return [s for s in closures.snoozes if s.until_iso >= today_iso]
 
 
 # ── Inbox polling ──────────────────────────────────────────────────────────
 
 async def _fetch_unread_replies(*, access_token: str, sender: str, since: datetime) -> list[dict]:
-    """Pull unread emails from the user to the agenda sender within the window.
-
-    Matches by ``from`` address (the user replying to themselves on the
-    agenda thread) and a subject prefix that identifies it as a reply to an
-    EMIS email.
-    """
+    """Pull unread emails from the user to the agenda sender within the window."""
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Prefer": 'outlook.body-content-type="text"',
     }
     iso = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    # Replies have "Re:" prefix; the recipient is the agenda sender; isRead is false.
     params = {
         "$top": "50",
         "$filter": (
@@ -184,7 +233,6 @@ async def _fetch_unread_replies(*, access_token: str, sender: str, since: dateti
 
 
 async def _mark_read(*, access_token: str, message_id: str) -> None:
-    """Mark a message as read so it isn't re-processed on the next poll."""
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -207,33 +255,31 @@ def parse_reply_via_claude(
     model: str,
     aws_region: str,
 ) -> list[dict[str, str]]:
-    """Send a reply body to Claude and get back snooze records."""
+    """Send a reply body to Claude and get back closure commands."""
     client = _make_client(api_key=api_key, model=model, aws_region=aws_region)
     is_bedrock = isinstance(client, anthropic.AnthropicBedrock)
-
     user_content = (
         f"Today's date: {now.date().isoformat()}\n\n"
         f"User's reply:\n{reply_text}"
     )
-
     kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": 4_000,
-        "system": SNOOZE_PARSER_SYSTEM,
+        "system": CLOSURES_PARSER_SYSTEM,
         "messages": [{"role": "user", "content": user_content}],
     }
     if is_bedrock:
         kwargs["tools"] = [{
-            "name": "emit_snoozes",
-            "description": "Emit parsed snooze commands.",
-            "input_schema": SNOOZE_PARSE_SCHEMA,
+            "name": "emit_closures",
+            "description": "Emit parsed closure commands.",
+            "input_schema": CLOSURES_PARSE_SCHEMA,
         }]
-        kwargs["tool_choice"] = {"type": "tool", "name": "emit_snoozes"}
+        kwargs["tool_choice"] = {"type": "tool", "name": "emit_closures"}
     else:
         kwargs["thinking"] = {"type": "adaptive"}
         kwargs["output_config"] = {
-            "format": {"type": "json_schema", "schema": SNOOZE_PARSE_SCHEMA},
-            "effort": "low",  # parsing is simple; don't burn tokens on thinking
+            "format": {"type": "json_schema", "schema": CLOSURES_PARSE_SCHEMA},
+            "effort": "low",
         }
 
     with client.messages.stream(**kwargs) as stream:
@@ -241,11 +287,10 @@ def parse_reply_via_claude(
 
     if is_bedrock:
         block = next(
-            (b for b in message.content if b.type == "tool_use" and b.name == "emit_snoozes"),
+            (b for b in message.content if b.type == "tool_use" and b.name == "emit_closures"),
             None,
         )
         if block is None:
-            logger.warning("snooze parser returned no tool_use block")
             return []
         parsed = block.input
     else:
@@ -254,7 +299,43 @@ def parse_reply_via_claude(
             return []
         parsed = json.loads(text_block.text)
 
-    return parsed.get("snoozes", []) or []
+    return parsed.get("commands", []) or []
+
+
+def apply_commands(
+    *, closures: Closures, commands: list[dict[str, str]],
+    now: datetime, source_message_id: str,
+) -> int:
+    """Append parsed commands onto the closures store. Returns count added."""
+    added = 0
+    ts = now.isoformat()
+    for cmd in commands:
+        action = cmd.get("action")
+        item = cmd.get("item_match", "").strip()
+        if not item:
+            continue
+        if action == "snooze":
+            until = cmd.get("until_iso", "").strip()
+            if not until:
+                continue
+            closures.snoozes.append(SnoozeRecord(
+                item_match=item, until_iso=until,
+                snoozed_at=ts, source_message_id=source_message_id,
+            ))
+            added += 1
+        elif action == "done":
+            closures.done.append(DoneRecord(
+                item_match=item, completed_at=ts,
+                source="reply_command", source_id=source_message_id,
+            ))
+            added += 1
+        elif action == "drop":
+            closures.drops.append(DropRecord(
+                item_match=item, dropped_at=ts,
+                source_message_id=source_message_id,
+            ))
+            added += 1
+    return added
 
 
 # ── Lambda entry ───────────────────────────────────────────────────────────
@@ -282,25 +363,21 @@ async def _run() -> dict[str, Any]:
 
     replies = await _fetch_unread_replies(
         access_token=tokens.access_token,
-        sender=cfg.agenda_recipient,  # user replies to their own agenda email
+        sender=cfg.agenda_recipient,
         since=since,
     )
     if not replies:
-        return {"status": "ok", "replies": 0, "snoozes_added": 0}
+        return {"status": "ok", "replies": 0, "added": 0}
 
-    existing = load_snoozes(cfg.state_bucket) if cfg.state_bucket else []
-    existing = prune_expired(existing, now)
-
+    closures = prune_closures(load_closures(cfg.state_bucket), now)
     added = 0
-    snoozed_at = now.isoformat()
     for reply in replies:
         body = (reply.get("body") or {}).get("content") or reply.get("bodyPreview", "")
         if not body.strip():
             continue
         try:
-            parsed = parse_reply_via_claude(
-                reply_text=body,
-                now=now,
+            commands = parse_reply_via_claude(
+                reply_text=body, now=now,
                 api_key=cfg.anthropic_api_key,
                 model=cfg.anthropic_model,
                 aws_region=cfg.aws_region,
@@ -308,32 +385,31 @@ async def _run() -> dict[str, Any]:
         except Exception as exc:
             logger.warning("parse failed for message %s: %s", reply["id"], exc)
             continue
-        for s in parsed:
-            existing.append(SnoozeRecord(
-                item_match=s["item_match"],
-                until_iso=s["until_iso"],
-                snoozed_at=snoozed_at,
-                source_message_id=reply["id"],
-            ))
-            added += 1
+        added += apply_commands(
+            closures=closures, commands=commands,
+            now=now, source_message_id=reply["id"],
+        )
         if not cfg.dry_run:
             try:
                 await _mark_read(access_token=tokens.access_token, message_id=reply["id"])
             except Exception as exc:
                 logger.warning("mark-read failed for %s: %s", reply["id"], exc)
 
-    if cfg.state_bucket and not cfg.dry_run:
-        save_snoozes(cfg.state_bucket, existing)
+    if not cfg.dry_run:
+        save_closures(cfg.state_bucket, closures)
 
     logger.info(
-        "snooze poll: replies=%d snoozes_added=%d total_active=%d",
-        len(replies), added, len(active_snoozes(existing, now)),
+        "closures poll: replies=%d added=%d snoozes=%d done=%d drops=%d",
+        len(replies), added,
+        len(closures.snoozes), len(closures.done), len(closures.drops),
     )
     return {
         "status": "ok",
         "replies": len(replies),
-        "snoozes_added": added,
-        "total_active": len(active_snoozes(existing, now)),
+        "added": added,
+        "snoozes_total": len(closures.snoozes),
+        "done_total": len(closures.done),
+        "drops_total": len(closures.drops),
     }
 
 

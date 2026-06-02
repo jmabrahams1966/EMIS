@@ -9,6 +9,7 @@ Endpoint reference: https://learn.microsoft.com/en-us/graph/api/todo-list-lists
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -16,6 +17,44 @@ import httpx
 logger = logging.getLogger(__name__)
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+async def list_completed_tasks(
+    access_token: str, list_id: str, since: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Return tasks in the list with status=completed (optionally since a date).
+
+    Used by the weekly agenda flow to detect items the user marked complete
+    in the Microsoft To Do app or Outlook Tasks, so we can record them as
+    `done` closures and stop resurfacing them.
+
+    Each returned dict has at least: ``id``, ``title``, ``completedDateTime``
+    (a dict with ``dateTime`` and ``timeZone`` keys per Graph schema).
+    """
+    headers = {"Authorization": f"Bearer {access_token}"}
+    filt = "status eq 'completed'"
+    if since is not None:
+        iso = since.astimezone().strftime("%Y-%m-%dT%H:%M:%S.000000")
+        filt += f" and completedDateTime/dateTime ge '{iso}'"
+    params = {
+        "$filter": filt,
+        "$top": "200",
+        "$select": "id,title,status,completedDateTime",
+    }
+    out: list[dict[str, Any]] = []
+    url = f"{GRAPH_BASE}/me/todo/lists/{list_id}/tasks"
+    async with httpx.AsyncClient(timeout=30) as client:
+        while url:
+            resp = await client.get(
+                url, headers=headers,
+                params=params if "$filter" in (params or {}) else None,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            out.extend(payload.get("value", []))
+            url = payload.get("@odata.nextLink")
+            params = None
+    return out
 
 
 async def ensure_list(access_token: str, list_name: str) -> str:

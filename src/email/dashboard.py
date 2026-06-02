@@ -322,8 +322,95 @@ _TABS = [
     ("actions", "Action items"),
     ("followups", "Follow-ups"),
     ("promises", "Promises"),
+    ("backlog", "Backlog"),
+    ("history", "History"),
     ("fyi", "FYI"),
 ]
+
+
+def _render_backlog_panel(agenda: dict, prior_agendas: list[dict] | None) -> str:
+    """Items that have lingered: status==carried_over or weeks_open >= 3.
+
+    Pulls from the current agenda plus any priors passed in (memory.py output).
+    """
+    seen: set[str] = set()
+    rows: list[str] = []
+
+    def _add(label: str, key: str, why: str):
+        sig = f"{label}::{key}"
+        if sig in seen:
+            return
+        seen.add(sig)
+        rows.append(f"<li style='margin-bottom:6px'>{label} <span style='color:#888;font-size:12px'>— {why}</span></li>")
+
+    for a in agenda.get("action_items", []):
+        if a.get("status") in ("carried_over", "stale"):
+            title = _linked(f"<strong>{escape(a['task'])}</strong>", a.get("web_link", ""))
+            _add(title, a.get("task", ""), f"action item · {escape(a.get('status', ''))}")
+    for f in agenda.get("follow_ups", []):
+        weeks = f.get("weeks_open", 0)
+        if f.get("status") in ("carried_over", "stale") or weeks >= 3:
+            title = _linked(f"<strong>{escape(f['thread'])}</strong>", f.get("web_link", ""))
+            why = f"follow-up · waiting on {escape(f.get('counterparty', ''))} · open {weeks}w"
+            _add(title, f.get("thread", ""), why)
+
+    # Also pull from prior agendas if provided (memory across weeks)
+    for entry in (prior_agendas or []):
+        a = entry.get("agenda", {})
+        iso = entry.get("iso_week", "")
+        for it in a.get("action_items", []):
+            if it.get("status") in ("carried_over", "stale"):
+                title = _linked(f"<strong>{escape(it.get('task', ''))}</strong>", it.get("web_link", ""))
+                _add(title, it.get("task", ""), f"from week {iso} · still open")
+        for it in a.get("follow_ups", []):
+            if it.get("status") in ("carried_over", "stale") or it.get("weeks_open", 0) >= 3:
+                title = _linked(f"<strong>{escape(it.get('thread', ''))}</strong>", it.get("web_link", ""))
+                _add(title, it.get("thread", ""), f"from week {iso} · still waiting")
+
+    if not rows:
+        return "<p style='color:#aaa'>Backlog is empty — nice.</p>"
+    return f"<ul style='line-height:1.6'>{''.join(rows)}</ul>"
+
+
+def _render_history_panel(closures: dict[str, list[dict[str, str]]] | None) -> str:
+    """Done items grouped by month (recent month first)."""
+    if not closures:
+        return "<p style='color:#aaa'>No completion history yet — reply 'done with X' to start tracking.</p>"
+    done = closures.get("done", []) or []
+    if not done:
+        return "<p style='color:#aaa'>No completion history yet — reply 'done with X' to start tracking.</p>"
+
+    # Group by YYYY-MM, sort newest first within each group.
+    by_month: dict[str, list[dict[str, str]]] = {}
+    for d in done:
+        key = (d.get("completed_at") or "")[:7]
+        if not key:
+            continue
+        by_month.setdefault(key, []).append(d)
+
+    parts: list[str] = []
+    for ym in sorted(by_month.keys(), reverse=True):
+        items = sorted(by_month[ym], key=lambda d: d.get("completed_at", ""), reverse=True)
+        try:
+            label = datetime.strptime(ym, "%Y-%m").strftime("%B %Y")
+        except ValueError:
+            label = ym
+        rows = "".join(
+            f"<li style='margin-bottom:4px'>"
+            f"<strong>{escape(d['item_match'])}</strong> "
+            f"<span style='color:#888;font-size:12px'>"
+            f"— {escape((d.get('completed_at') or '')[:10])} · {escape(d.get('source', ''))}"
+            f"</span></li>"
+            for d in items
+        )
+        parts.append(
+            f"<div style='margin-bottom:18px'>"
+            f"<div style='font-weight:600;color:#444;margin-bottom:6px'>"
+            f"{label} <span style='color:#888;font-weight:400;font-size:12px'>"
+            f"({len(items)} completed)</span></div>"
+            f"<ul style='line-height:1.55;margin-top:0'>{rows}</ul></div>"
+        )
+    return "".join(parts)
 
 
 def render_dashboard_html(
@@ -331,6 +418,8 @@ def render_dashboard_html(
     week_start: datetime,
     week_end: datetime,
     mode: str = "monday",
+    closures: dict[str, list[dict[str, str]]] | None = None,
+    prior_agendas: list[dict[str, Any]] | None = None,
 ) -> str:
     """Render an interactive single-page dashboard for the agenda."""
     title = {
@@ -347,6 +436,8 @@ def render_dashboard_html(
         "actions": _render_actions_panel(agenda),
         "followups": _render_followups_panel(agenda),
         "promises": _render_promises_panel(agenda),
+        "backlog": _render_backlog_panel(agenda, prior_agendas),
+        "history": _render_history_panel(closures),
         "fyi": _render_fyi_panel(agenda),
     }
 

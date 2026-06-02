@@ -101,16 +101,27 @@ Cross-cutting views in week_summary:
   in one short clause. Same for clusters of items with deadlines in the \
   same window. Don't construct a full table — one sentence is enough.
 
-User-defined snoozes:
-- A SNOOZED ITEMS block may appear in the user turn listing items the user \
-  has explicitly asked to defer ("snooze the Costco thread until Monday"). \
-  Each entry is `<item_match> until <YYYY-MM-DD>`. If an incoming thread, \
-  action item, or follow-up clearly corresponds to a snoozed entry whose \
-  `until` date is in the future, suppress it: do not include it in \
-  priorities, action_items, or follow_ups. You may mention it in \
-  `week_summary` if it's load-bearing context, but otherwise leave it out. \
-  If the `until` date has passed (the user turn will only list active \
-  snoozes), the item is fair game again.
+User-defined closures (snoozes / done / drops):
+A CLOSURES block may appear in the user turn with three sub-lists. Treat \
+each differently:
+
+- **Snoozed** ("<item_match> until <YYYY-MM-DD>"): the user has explicitly \
+  deferred this item. Suppress it from priorities, action_items, \
+  follow_ups. Don't mention it in week_summary unless it's load-bearing \
+  context. The user turn only lists active snoozes; expired ones are fair \
+  game again.
+
+- **Done** ("<item_match> (completed <date>)"): the user has confirmed \
+  this item is closed (either via reply command or via Microsoft To Do \
+  sync). If a related thread still appears in the incoming mail, mark the \
+  derived item's `status` as `resolved` (not `carried_over`) and surface \
+  it in `week_summary` rather than as an open priority/action. Don't \
+  re-list it as a new action_item or follow_up. If the thread has truly \
+  gone quiet, omit entirely — the user already knows it's done.
+
+- **Dropped** ("<item_match> (dropped)"): permanent suppression. Don't \
+  include in any section. Don't mention in week_summary. Treat the topic \
+  as if it doesn't exist.
 """
 
 

@@ -71,7 +71,7 @@ def build_agenda(
     api_key: str,
     model: str = "claude-opus-4-7",
     aws_region: str = "us-east-1",
-    snoozes: list[dict[str, str]] | None = None,
+    closures: dict[str, list[dict[str, str]]] | None = None,
 ) -> AgendaResult:
     """Generate the agenda for ``mode`` in (monday, wednesday, friday)."""
     if mode not in MODE_NOTES:
@@ -85,7 +85,7 @@ def build_agenda(
         calendar_events=calendar_events, prior_agendas=prior_agendas,
         attachment_texts=attachment_texts,
         week_start=week_start, week_end=week_end,
-        snoozes=snoozes or [],
+        closures=closures or {"snoozes": [], "done": [], "drops": []},
     )
 
     # 64K gives the model room to produce the full agenda without truncating;
@@ -166,12 +166,27 @@ def build_agenda(
 
 # ── User turn rendering ────────────────────────────────────────────────────
 
-def _render_snoozes(snoozes: list[dict[str, str]]) -> str:
-    if not snoozes:
+def _render_closures(closures: dict[str, list[dict[str, str]]]) -> str:
+    snoozes = closures.get("snoozes", [])
+    done = closures.get("done", [])
+    drops = closures.get("drops", [])
+    if not (snoozes or done or drops):
         return ""
-    lines = ["===== SNOOZED ITEMS (suppress these from the agenda) ====="]
-    for s in snoozes:
-        lines.append(f"  - {s['item_match']} until {s['until_iso']}")
+    lines = ["===== USER-DEFINED CLOSURES ====="]
+    if snoozes:
+        lines.append("Snoozed (suppress until date):")
+        for s in snoozes:
+            lines.append(f"  - {s['item_match']} until {s['until_iso']}")
+    if done:
+        lines.append("Done (treat related threads as resolved):")
+        for d in done:
+            # completed_at is an ISO timestamp; only display the date.
+            completed_date = d.get("completed_at", "")[:10]
+            lines.append(f"  - {d['item_match']} (completed {completed_date})")
+    if drops:
+        lines.append("Dropped (never resurface):")
+        for d in drops:
+            lines.append(f"  - {d['item_match']}")
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -186,7 +201,7 @@ def _render_user_turn(
     attachment_texts: dict[str, list[tuple[str, str]]],
     week_start: datetime,
     week_end: datetime,
-    snoozes: list[dict[str, str]],
+    closures: dict[str, list[dict[str, str]]],
 ) -> str:
     header = (
         f"{MODE_NOTES[mode]}\n\n"
@@ -197,7 +212,7 @@ def _render_user_turn(
         f"Today's date: {week_end.date().isoformat()}\n"
     )
     chunks: list[str] = [header]
-    chunks.append(_render_snoozes(snoozes))
+    chunks.append(_render_closures(closures))
     chunks.append(render_memory_block(prior_agendas, max_chars=MAX_MEMORY_CHARS))
     chunks.append(_render_calendar(calendar_events, max_chars=MAX_CALENDAR_CHARS))
     chunks.append(_render_sent(sent_messages, max_chars=MAX_SENT_CHARS))

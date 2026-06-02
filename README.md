@@ -109,23 +109,50 @@ week), `resolved` (recently closed — surfaced in `week_summary`), or `stale`
    ```
    These are loaded fresh on every run — no redeploy needed.
 
-## Replying to snooze
+## Closing the loop
 
-Hit Reply on any EMIS email and tell it which items to defer:
+Hit Reply on any EMIS email and tell it what to do with items — three
+verbs are supported:
 
 ```
-snooze the Costco DCF thread until next Monday
-snooze horizon enrollment for 2 weeks
+snooze the Costco DCF until next Monday
+done with the malpractice premium
+already paid Rising Fastball
+drop the all-hands FYI
 ```
 
-A second Lambda polls your inbox every 30 min, parses replies via Claude
-(natural language — phrasing doesn't matter), and writes snoozes to
-`s3://<state-bucket>/state/snoozes.json`. The next agenda run reads them
-and suppresses matching items from priorities / action_items / follow_ups
-until the `until` date passes. Snoozes auto-expire and are pruned after 90
-days.
+A polling Lambda runs every 30 min, parses replies via Claude (free-form —
+phrasing doesn't matter; "did", "finished", "paid", "called", "handled"
+are all `done` signals), and writes records to
+`s3://<state-bucket>/state/closures.json`. The next agenda run:
 
-Drop / done / delegate aren't supported yet — only snooze.
+- **snooze** → suppresses the item until the date you named (defaults to 1
+  week if no date)
+- **done** → if the topic resurfaces in mail, marks `status: resolved` and
+  surfaces it in `week_summary` instead of as a new action; also appears
+  in the dashboard's **History** tab
+- **drop** → permanent suppression. Never resurfaces.
+
+### Two-way Microsoft To Do sync
+
+EMIS already creates To Do tasks for action items where you're the owner.
+On each weekly run, EMIS also reads back which of those tasks you've
+marked complete in To Do (or Outlook Tasks) and records them as `done`
+closures automatically — so a check-off in your To Do app closes the loop
+without needing a reply. Useful if you live in To Do; harmless if you
+don't (just no auto-done events).
+
+### Dashboard tabs
+
+Open `agenda.{mode}.dashboard.html` and the tabs you'll see:
+
+| Tab | What's in it |
+|---|---|
+| Week at a glance | Mon-Sun cards with meetings + dated actions |
+| Priorities / Meetings / Action items / Follow-ups / Promises | The agenda's main sections |
+| **Backlog** | Persistent to-dos: every carried-over action item + follow-ups open ≥ 3 weeks, deduped across the last 4 weekly agendas |
+| **History** | Everything you've marked done, grouped by month newest-first. Click-friendly review of "what did I accomplish" |
+| FYI | Awareness-only context |
 
 ## Web UI
 
