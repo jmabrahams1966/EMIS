@@ -97,9 +97,12 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
         src = f" — *{a['source_subject']}*" if a.get("source_subject") else ""
         marker = {"new": "•", "carried_over": "↻", "resolved": "✓", "stale": "⚠"}.get(status, "•")
         title = _md_link(f"**{a.get('task', '')}**", a.get("web_link", ""))
-        out.append(
-            f"- {marker} {title} [{owner}, due {due}, {urgency}, {status}]{src}"
-        )
+        # Two-bullet style: task on top, metadata as nested sub-bullet.
+        out.append(f"- {marker} {title}")
+        meta = " · ".join(filter(None, [
+            f"[{urgency}]", owner, f"due {due}" if due else "", status,
+        ]))
+        out.append(f"    - {meta}{src}")
     out.append("")
 
     out.append("## Follow-ups (waiting on others)")

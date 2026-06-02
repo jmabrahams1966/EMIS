@@ -121,14 +121,24 @@ def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime
         )
 
     def _action_li(a: dict) -> str:
+        # Two bullets per action: task on top, metadata as a nested sub-bullet.
         title = _linked(f"<strong>{escape(a['task'])}</strong>", a.get("web_link", ""))
-        src = f" <em style='color:#666'>({escape(a['source_subject'])})</em>" if a.get("source_subject") else ""
-        return (
-            f"{status_badge(a.get('status', 'new'))} {title} "
-            f"<span style='color:#666;font-size:12px'>"
-            f"({escape(a.get('owner', '?'))}, due {escape(a.get('due', ''))}, "
-            f"{urgency_badge(a.get('urgency', 'medium'))})</span>{src}"
+        meta_bits = [
+            urgency_badge(a.get("urgency", "medium")),
+            escape(a.get("owner", "?")),
+            f"due {escape(a.get('due', ''))}" if a.get("due") else "",
+            escape(a.get("status", "new")),
+        ]
+        meta = " · ".join(b for b in meta_bits if b)
+        src = (
+            f"<em style='color:#888'>({escape(a['source_subject'])})</em>"
+            if a.get("source_subject") else ""
         )
+        sub_bullet = (
+            f"<ul style='margin:2px 0 0 0;padding-left:18px;color:#666;font-size:12px'>"
+            f"<li>{meta} {src}</li></ul>"
+        )
+        return f"{status_badge(a.get('status', 'new'))} {title}{sub_bullet}"
 
     def _followup_li(f: dict) -> str:
         title = _linked(f"<strong>{escape(f['thread'])}</strong>", f.get("web_link", ""))
@@ -242,13 +252,19 @@ def render_text(agenda: dict[str, Any], week_start: datetime, week_end: datetime
     lines += ["", "ACTION ITEMS"]
     for a in agenda.get("action_items", []):
         mark = _STATUS_MARK.get(a.get("status", "new"), "•")
+        # Two-bullet style: task on top, metadata as indented sub-bullet.
+        lines.append(f"  {mark} {a['task']}")
+        meta_bits = list(filter(None, [
+            f"[{a.get('urgency', 'medium')}]",
+            a.get("owner", "?"),
+            f"due {a.get('due', '')}" if a.get("due") else "",
+            a.get("status", "new"),
+        ]))
+        meta = " · ".join(meta_bits)
         src = f" ({a['source_subject']})" if a.get("source_subject") else ""
-        lines.append(
-            f"  {mark} [{a.get('owner', '?')}, due {a.get('due', '')}, "
-            f"{a.get('urgency', 'medium')}, {a.get('status', 'new')}] {a['task']}{src}"
-        )
+        lines.append(f"      - {meta}{src}")
         if a.get("web_link"):
-            lines.append(f"      {a['web_link']}")
+            lines.append(f"        {a['web_link']}")
 
     lines += ["", "FOLLOW-UPS"]
     for f in agenda.get("follow_ups", []):

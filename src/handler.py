@@ -35,6 +35,7 @@ from .agenda.filters import apply_filters, load_blocklist, load_vip
 from .agenda.memory import load_prior_agendas
 from .agenda.threading import group_into_threads
 from .config import load_config
+from .email.dashboard import render_dashboard_html
 from .email.sender import render_briefs_html, render_briefs_text, render_html, render_text, send_via_ses
 from .export import markdown as md_export
 from .graph import auth as graph_auth
@@ -170,9 +171,11 @@ async def _run(mode: str) -> dict[str, Any]:
     subject = _email_subject(mode, now)
 
     if cfg.dry_run:
+        dashboard_html = render_dashboard_html(result.agenda, since, now, mode=mode)
         previews = _write_previews(
             name=f"agenda.{mode}",
             html=html, text=text, md=md_text, pdf_bytes=pdf_bytes,
+            dashboard=dashboard_html,
         )
         if previews:
             logger.info("wrote previews: %s", ", ".join(previews.values()))
@@ -342,6 +345,7 @@ def _write_previews(
     text: str,
     md: str | None = None,
     pdf_bytes: bytes | None = None,
+    dashboard: str | None = None,
 ) -> dict[str, str]:
     """Write rendered outputs to ``$PREVIEW_DIR`` so they can be opened directly.
 
@@ -374,6 +378,11 @@ def _write_previews(
         with open(pdf_path, "wb") as f:
             f.write(pdf_bytes)
         written["pdf"] = pdf_path
+    if dashboard is not None:
+        dash_path = os.path.join(preview_dir, f"{name}.dashboard.html")
+        with open(dash_path, "w", encoding="utf-8") as f:
+            f.write(dashboard)
+        written["dashboard"] = dash_path
     return written
 
 

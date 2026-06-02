@@ -33,7 +33,7 @@ from urllib.parse import urlencode
 
 import boto3
 
-from .email.sender import render_html as render_email_html
+from .email.dashboard import render_dashboard_html
 from .state import store
 
 logger = logging.getLogger("emis.web_ui")
@@ -156,23 +156,16 @@ def _render_week_page(bucket: str, week: str, token: str) -> str:
 
 
 def _render_agenda_page(bucket: str, week: str, mode: str, agenda: dict, token: str) -> str:
-    # Reuse the email HTML so the web view stays in sync with the email view.
-    # Synthesize a date range from the ISO week.
+    """Serve the interactive dashboard rendering of a stored agenda."""
     try:
         year, w = week.split("-W")
         week_start = datetime.fromisocalendar(int(year), int(w), 1)
         week_end = datetime.fromisocalendar(int(year), int(w), 7)
     except Exception:
         week_start = week_end = datetime.utcnow()
-
-    nav = (
-        f"<div class='nav'>"
-        f"<a href='?{urlencode({'token': token})}'>← all weeks</a>  ·  "
-        f"<a href='?{urlencode({'token': token, 'week': week})}'>back to {escape(week)}</a>"
-        f"</div>"
-    )
-    inner = render_email_html(agenda, week_start, week_end, mode=mode)
-    return _chrome(f"{week} ({mode})", nav + inner)
+    # The dashboard is a fully self-contained HTML document — return it
+    # directly without wrapping it in _chrome (which has its own <head>).
+    return render_dashboard_html(agenda, week_start, week_end, mode=mode)
 
 
 def _modes_for_week(s3, bucket: str, week: str) -> list[str]:

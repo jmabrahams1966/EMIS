@@ -156,12 +156,18 @@ the plaintext fallback printed to the terminal), set `PREVIEW_DIR`:
 export PREVIEW_DIR=./preview
 python -m src.handler monday
 
-open preview/agenda.monday.html     # opens in browser → same render as the email
-open preview/agenda.monday.pdf      # opens in Preview → same as OneDrive archive
+open preview/agenda.monday.html           # static email render
+open preview/agenda.monday.dashboard.html # interactive dashboard (tabs + "+ Cal")
+open preview/agenda.monday.pdf            # OneDrive archive
 ```
 
-The morning briefs flow writes `briefs.morning.html` / `.txt` (no PDF/MD for
-briefs).
+The dashboard is the interactive view: tabbed navigation (Week at a glance /
+Priorities / Meetings / Action items / Follow-ups / Promises / FYI), every
+dated item has a "+ Cal" button that downloads a one-event ICS so you can
+add it to your calendar with one click, and links jump to the source Outlook
+thread. It's the same HTML the deployed Web UI Lambda serves. The morning
+briefs flow writes `briefs.morning.html` / `.txt` (no dashboard for briefs —
+they're already short).
 
 ## Repo layout
 
