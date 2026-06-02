@@ -82,9 +82,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     qs = (event.get("queryStringParameters") or {}) or {}
     week = qs.get("week")
     mode = qs.get("mode")
-    # Link generation needs the token so browser navigation keeps working. If
-    # the caller only supplied a header, generated links omit it — Authorization
-    # must then be re-supplied by the client on each request.
+    view = qs.get("view", "")
     link_token = qs.get("token", "") or ""
 
     if week and mode:
@@ -96,7 +94,34 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if week:
         return _resp(_render_week_page(bucket, week, link_token))
 
+    # Default landing: jump straight to the latest week's Monday agenda so
+    # opening the bookmark mid-week shows current state rather than a list.
+    # Pass `&view=list` to override and see the index instead.
+    if view != "list":
+        latest = _find_latest_agenda(bucket)
+        if latest is not None:
+            week_iso, mode_name, agenda = latest
+            return _resp(_render_agenda_page(bucket, week_iso, mode_name, agenda, link_token))
+
     return _resp(_render_index_page(bucket, link_token))
+
+
+def _find_latest_agenda(bucket: str) -> tuple[str, str, dict] | None:
+    """Return (week_iso, mode, agenda) for the most recent stored agenda.
+
+    Preference order: most recent week with Monday agenda (canonical); fall
+    back to whatever mode exists for that week. Returns None if no agendas
+    are persisted yet.
+    """
+    weeks = store.list_weeks(bucket, limit=1)
+    if not weeks:
+        return None
+    week_iso = weeks[0]
+    for mode_name in ("monday", "wednesday", "friday"):
+        agenda = store.load_agenda(bucket, week_iso, mode_name)
+        if agenda:
+            return (week_iso, mode_name, agenda)
+    return None
 
 
 # ── Rendering ──────────────────────────────────────────────────────────────

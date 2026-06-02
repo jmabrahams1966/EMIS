@@ -79,7 +79,30 @@ def _linked(title_html: str, web_link: str) -> str:
     )
 
 
-def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mode: str = "monday") -> str:
+def _dashboard_banner(web_ui_url: str, web_ui_token: str, week_iso: str, mode: str) -> str:
+    """Render a header bar with a link into the interactive dashboard.
+
+    Returns an empty string if either piece of config is missing (e.g. on
+    local dry-runs where there's no deployed Web UI to link to).
+    """
+    if not web_ui_url or not web_ui_token:
+        return ""
+    from urllib.parse import urlencode
+    qs = urlencode({"token": web_ui_token, "week": week_iso, "mode": mode})
+    url = f"{web_ui_url.rstrip('/')}/?{qs}"
+    return (
+        f"<div style='margin:-8px -24px 16px;padding:10px 24px;"
+        f"background:#eef4ff;border-bottom:1px solid #cfe0ff;"
+        f"font-size:13px;color:#2c6cdf'>"
+        f"<a href='{url}' style='color:#2c6cdf;text-decoration:none;font-weight:600'>"
+        f"View interactive dashboard →</a>"
+        f"<span style='color:#666;font-weight:400'> "
+        f"&nbsp;·&nbsp; tabs, calendar links, backlog &amp; history</span>"
+        f"</div>"
+    )
+
+
+def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mode: str = "monday", web_ui_url: str = "", web_ui_token: str = "") -> str:
     title = {
         "monday": "Weekly Agenda",
         "wednesday": "Mid-Week Check-in",
@@ -205,9 +228,13 @@ def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime
 
     body_html += section("FYI", fyi)
 
+    iso = week_start.isocalendar()
+    week_iso = f"{iso.year:04d}-W{iso.week:02d}"
+    banner = _dashboard_banner(web_ui_url, web_ui_token, week_iso, mode)
     return f"""\
 <!doctype html>
 <html><body style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:680px;margin:auto;padding:24px;color:#222">
+  {banner}
   <h1 style="margin-bottom:4px">{escape(title)}</h1>
   <p style="color:#666;margin-top:0">{week_start.date()} – {week_end.date()}</p>
   <p style="font-size:15px;line-height:1.55">{escape(agenda.get('week_summary', ''))}</p>
@@ -312,7 +339,7 @@ def render_text(agenda: dict[str, Any], week_start: datetime, week_end: datetime
     return "\n".join(lines)
 
 
-def render_briefs_html(briefs: list[dict[str, Any]], when: datetime) -> str:
+def render_briefs_html(briefs: list[dict[str, Any]], when: datetime, web_ui_url: str = "", web_ui_token: str = "") -> str:
     """HTML render for the daily pre-meeting briefs email."""
     if not briefs:
         return (
@@ -353,9 +380,13 @@ def render_briefs_html(briefs: list[dict[str, Any]], when: datetime) -> str:
         )
 
     body_html = "".join(_brief_block(b) for b in briefs)
+    iso = when.isocalendar()
+    week_iso = f"{iso.year:04d}-W{iso.week:02d}"
+    banner = _dashboard_banner(web_ui_url, web_ui_token, week_iso, "monday")
     return f"""\
 <!doctype html>
 <html><body style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:680px;margin:auto;padding:24px;color:#222">
+  {banner}
   <h1 style="margin-bottom:4px">Today's Briefs</h1>
   <p style="color:#666;margin-top:0">{when.date()} — {len(briefs)} meeting{"s" if len(briefs) != 1 else ""}</p>
   {body_html}

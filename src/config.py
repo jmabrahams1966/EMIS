@@ -38,6 +38,7 @@ class Config:
     create_todo_tasks: bool = True
     upload_to_onedrive: bool = True
     web_ui_token: str = ""        # required for web UI access
+    web_ui_url: str = ""          # base URL of the Web UI Lambda; embeds in email headers
     dry_run: bool = False
 
 
@@ -84,6 +85,7 @@ def load_config() -> Config:
             create_todo_tasks=_bool("CREATE_TODO_TASKS", True),
             upload_to_onedrive=_bool("UPLOAD_TO_ONEDRIVE", True),
             web_ui_token=os.getenv("WEB_UI_TOKEN", ""),
+            web_ui_url=os.getenv("WEB_UI_URL", ""),
             dry_run=True,
         )
 

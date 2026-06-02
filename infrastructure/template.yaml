@@ -84,6 +84,11 @@ Resources:
           STATE_BUCKET: !Ref StateBucket
           TODO_LIST_NAME: !Ref TodoListName
           ONEDRIVE_FOLDER: !Ref OneDriveFolder
+          # Web UI URL + token so the agenda email can deep-link into the
+          # interactive dashboard. The token gives access to past agendas
+          # too — keep it private.
+          WEB_UI_URL: !GetAtt WebUiFunctionUrl.FunctionUrl
+          WEB_UI_TOKEN: !Ref WebUiToken
       Policies:
         - Version: '2012-10-17'
           Statement:

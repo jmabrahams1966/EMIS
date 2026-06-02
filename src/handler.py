@@ -119,6 +119,8 @@ async def _run(mode: str) -> dict[str, Any]:
         week_start=since,
         max_bytes=cfg.max_attachment_bytes,
         dry_run=cfg.dry_run,
+        onedrive_folder=cfg.onedrive_folder,
+        mirror_to_onedrive=cfg.upload_to_onedrive,
     )
 
     # 6. Memory — anchor lookback on `now` so weeks_back=1 is last week,
@@ -189,7 +191,10 @@ async def _run(mode: str) -> dict[str, Any]:
         store.save_agenda(cfg.state_bucket, since, mode, result.agenda)
 
     # 8. Render
-    html = render_html(result.agenda, since, now, mode=mode)
+    html = render_html(
+        result.agenda, since, now, mode=mode,
+        web_ui_url=cfg.web_ui_url, web_ui_token=cfg.web_ui_token,
+    )
     text = render_text(result.agenda, since, now, mode=mode)
     md_text = md_export.render(result.agenda, since, now, mode=mode)
     try:
@@ -346,7 +351,10 @@ async def _run_briefs() -> dict[str, Any]:
     )
 
     # 6. Render
-    html = render_briefs_html(result.briefs, now)
+    html = render_briefs_html(
+        result.briefs, now,
+        web_ui_url=cfg.web_ui_url, web_ui_token=cfg.web_ui_token,
+    )
     text = render_briefs_text(result.briefs, now)
     subject = f"Today's briefs — {now.strftime('%a %b %d')}"
 
@@ -469,8 +477,11 @@ def _token_dict(result) -> dict[str, int]:
 
 async def _extract_all_attachments(
     *, access_token, messages, bucket, week_start, max_bytes, dry_run,
+    onedrive_folder: str = "", mirror_to_onedrive: bool = False,
 ):
     out: dict[str, list[tuple[str, str]]] = {}
+    iso = week_start.isocalendar()
+    week_label = f"{iso.year:04d}-W{iso.week:02d}"
     for msg in messages:
         if not msg.has_attachments:
             continue
@@ -491,6 +502,19 @@ async def _extract_all_attachments(
                     )
                 except Exception as exc:
                     logger.warning("S3 put failed for %s: %s", att.name, exc)
+            if mirror_to_onedrive and onedrive_folder and not dry_run:
+                # Mirror to OneDrive so attachments are browsable in Files
+                # alongside the agenda PDF/Markdown — same per-week layout.
+                try:
+                    safe_name = att.name.replace("/", "_")
+                    await graph_onedrive.upload_file(
+                        access_token=access_token,
+                        path=f"{onedrive_folder}/{week_label}/attachments/{msg.id}/{safe_name}",
+                        data=att.content_bytes,
+                        content_type=att.content_type,
+                    )
+                except Exception as exc:
+                    logger.warning("OneDrive attachment upload failed for %s: %s", att.name, exc)
             text = extract.extract(att.name, att.content_type, att.content_bytes)
             if text:
                 extracted.append((att.name, text))
