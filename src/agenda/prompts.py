@@ -68,11 +68,29 @@ Quality bar:
 
 Linking back to the source:
 - Every item that ties to a single source — priorities, meetings, action items, \
-  follow-ups, promises — has a `web_link` field. Populate it with the URL \
+  follow-ups — has a `web_link` field. Populate it with the URL \
   shown next to the source in this turn (the `web:` line on a thread, \
   calendar event, or sent message). Copy the URL verbatim. If the item \
   draws from multiple sources or no single source is identifiable, leave \
   `web_link` as an empty string. Do not invent URLs.
+
+Action items unify asks and promises:
+- `action_items` contains everything the user owes — whether it came from an \
+  incoming mail asking for something (`source: "asked"`) or from the user's \
+  own sent mail where they committed to do something (`source: "promised"`). \
+  One unified list. Never duplicate the same item across the two signals. \
+  When in doubt, promised outranks asked — written commitment is the stronger \
+  signal. Bias urgency upward for promised items (deadlines you set for \
+  yourself in writing are higher accountability than asks others made of you).
+- Populate `to_party` for promised items (who the user committed to). For \
+  asked items where owner is the user, `to_party` is the asker; otherwise ''.
+
+Categorization:
+- Every priority and action_item must be tagged with `category` — one of \
+  `clinical`, `business`, `admin`, `personal`. Patient care / OR / clinical \
+  research = clinical. Ventures / sales / billing / vendors = business. \
+  Privacy / compliance / legal / IT / credentialing = admin. Everything \
+  else = personal. Default to your best judgment; don't ask.
 
 Why each priority bubbled up:
 - For every priority, populate `why_now` with a one-sentence reason this item \
@@ -96,10 +114,25 @@ Clinical sensitivity (medical-practice context):
   action items in their own right when warranted — not just as FYI.
 
 Cross-cutting views in week_summary:
-- If a single counterparty appears across multiple follow-ups or promises \
+- If a single counterparty appears across multiple action_items or follow-ups \
   (you owe Jane 3 things; Jane owes you 1), call it out in `week_summary` \
   in one short clause. Same for clusters of items with deadlines in the \
   same window. Don't construct a full table — one sentence is enough.
+
+User-defined pins:
+- A USER_PINS block may appear in the user turn listing items the user has \
+  manually pinned. Every pinned title MUST appear as a priority in this \
+  agenda regardless of natural ranking, with `pinned: true`. Set urgency to \
+  match its real-world signal — pinning doesn't force `high`, it forces \
+  *visibility*. Pinned items also stay in priorities even if the related \
+  thread has gone quiet — the user pinned them specifically to fight drift.
+
+User-defined notes per item:
+- A USER_NOTES block may appear in the user turn as `<item_match>: <note>`. \
+  When generating an action_item whose `task` matches an entry, copy the \
+  note verbatim into `user_note`. Don't paraphrase. If an item has no \
+  matching note, set `user_note: ""`. Treat the note as user-provided \
+  ground truth — let it inform urgency/status if relevant.
 
 User-defined closures (snoozes / done / drops):
 A CLOSURES block may appear in the user turn with three sub-lists. Treat \
@@ -155,11 +188,14 @@ AGENDA_SCHEMA = {
     "type": "object",
     "properties": {
         "week_summary": {
-            "type": "string",
+            "type": "array",
             "description": (
-                "Two to four sentences. Shape of the week, what dominates, "
-                "what closed (Friday mode), what's slipping (Wednesday mode)."
+                "3-6 bullets covering the shape of the week — what dominates, "
+                "what closed (Friday mode), what's slipping (Wednesday mode). "
+                "Each bullet is one complete sentence the user can scan; do "
+                "not write paragraphs."
             ),
+            "items": {"type": "string"},
         },
         "priorities": {
             "type": "array",
@@ -186,9 +222,23 @@ AGENDA_SCHEMA = {
                             "Empty string if no specific signal."
                         ),
                     },
+                    "category": {
+                        "type": "string",
+                        "enum": ["clinical", "business", "admin", "personal"],
+                        "description": "Same buckets as action_items.category.",
+                    },
+                    "pinned": {
+                        "type": "boolean",
+                        "description": (
+                            "True only if the title appears in the user_pins block "
+                            "provided in context. Pinned items must be present here "
+                            "regardless of natural ranking."
+                        ),
+                    },
                 },
                 "required": [
-                    "title", "reason", "source_subject", "urgency", "web_link", "why_now",
+                    "title", "reason", "source_subject", "urgency", "web_link",
+                    "why_now", "category", "pinned",
                 ],
                 "additionalProperties": False,
             },
@@ -221,7 +271,13 @@ AGENDA_SCHEMA = {
         },
         "action_items": {
             "type": "array",
-            "description": "Concrete tasks the user (or a named owner) must complete.",
+            "description": (
+                "Things the user owes — pulled from BOTH incoming mail (asks) "
+                "and outgoing sent mail (promises). One unified list; tag each "
+                "with `source`. Never duplicate the same item across the two "
+                "signals — pick the stronger source (a written promise outranks "
+                "an inferred ask)."
+            ),
             "items": {
                 "type": "object",
                 "properties": {
@@ -239,10 +295,42 @@ AGENDA_SCHEMA = {
                         "type": "string",
                         "enum": ["high", "medium", "low"],
                     },
+                    "source": {
+                        "type": "string",
+                        "enum": ["asked", "promised"],
+                        "description": (
+                            "`asked` = inferred from a message someone sent the user. "
+                            "`promised` = pulled from the user's own Sent mail. "
+                            "Promises carry higher accountability — bias their urgency upward."
+                        ),
+                    },
+                    "to_party": {
+                        "type": "string",
+                        "description": "Who the item is owed to. '' if owner != 'you' or unclear.",
+                    },
                     "source_subject": {"type": "string"},
                     "status": {
                         "type": "string",
                         "enum": ["new", "carried_over", "resolved", "stale"],
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["clinical", "business", "admin", "personal"],
+                        "description": (
+                            "Bucket the item for filtering. Clinical = patient care, "
+                            "OR, clinical research. Business = ventures, sales, "
+                            "billing, finance, vendor management. Admin = privacy, "
+                            "compliance, legal, IT, credentialing, scheduling. "
+                            "Personal = anything else (family, household, social)."
+                        ),
+                    },
+                    "user_note": {
+                        "type": "string",
+                        "description": (
+                            "If a user_notes block was provided in context with "
+                            "a matching item, copy that note verbatim here. "
+                            "Otherwise ''."
+                        ),
                     },
                     "web_link": {
                         "type": "string",
@@ -250,8 +338,9 @@ AGENDA_SCHEMA = {
                     },
                 },
                 "required": [
-                    "task", "owner", "due", "due_date", "urgency",
-                    "source_subject", "status", "web_link",
+                    "task", "owner", "due", "due_date", "urgency", "source",
+                    "to_party", "source_subject", "status", "category",
+                    "user_note", "web_link",
                 ],
                 "additionalProperties": False,
             },
@@ -282,28 +371,6 @@ AGENDA_SCHEMA = {
                 "additionalProperties": False,
             },
         },
-        "promises_made": {
-            "type": "array",
-            "description": (
-                "Things the user committed to in *sent* mail this week. "
-                "Empty list if no sent mail provided or nothing committed."
-            ),
-            "items": {
-                "type": "object",
-                "properties": {
-                    "commitment": {"type": "string"},
-                    "to": {"type": "string"},
-                    "by": {"type": "string"},
-                    "source_subject": {"type": "string"},
-                    "web_link": {
-                        "type": "string",
-                        "description": "URL of the sent message, '' if unknown.",
-                    },
-                },
-                "required": ["commitment", "to", "by", "source_subject", "web_link"],
-                "additionalProperties": False,
-            },
-        },
         "fyi": {
             "type": "array",
             "description": "Awareness-only items, one sentence each. Max 6.",
@@ -312,7 +379,7 @@ AGENDA_SCHEMA = {
     },
     "required": [
         "week_summary", "priorities", "meetings", "action_items",
-        "follow_ups", "promises_made", "fyi",
+        "follow_ups", "fyi",
     ],
     "additionalProperties": False,
 }

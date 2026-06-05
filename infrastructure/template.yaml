@@ -28,6 +28,28 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Shared-secret token for the web UI (any random string >= 24 chars).
+  TwilioSecretId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional. Secrets Manager ID of a JSON secret with account_sid,
+      auth_token, from_number, to_number for Twilio SMS notifications.
+      Leave blank to disable SMS delivery.
+  DefaultUserId:
+    Type: String
+    Default: ''
+    Description: >
+      Phase 1 multi-tenant stopgap. When set, the Web UI scopes all reads
+      and writes to users/{id}/... for this user. Phase 2 (Microsoft SSO)
+      will replace this with per-request identity.
+  WebUiUrlOverride:
+    Type: String
+    Default: ''
+    Description: >
+      The deployed Web UI Function URL. Pinned via samconfig override to
+      break the circular dependency between AgendaFunction (which needs the
+      URL for email banners) and WebUiFunction (which needs to invoke
+      AgendaFunction for the admin "run now" feature).
   MondaySchedule:
     Type: String
     Default: cron(0 11 ? * MON *)
@@ -48,8 +70,51 @@ Parameters:
     Type: String
     Default: rate(30 minutes)
     Description: How often the reply-command Lambda polls the inbox for snooze instructions.
+  AdminDigestSchedule:
+    Type: String
+    Default: cron(0 13 ? * SAT *)
+    Description: Saturday 09:00 ET = 13:00 UTC — weekly admin operational digest.
 
 Resources:
+
+  # ── Multi-tenant primitives ──────────────────────────────────────────────
+  # KMS customer-managed key used to encrypt refresh tokens at rest in the
+  # Users table. Separate from default DynamoDB encryption so we have an
+  # explicit audit trail (CloudTrail) for every Decrypt call.
+  TokenEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: EMIS — encrypts per-user Microsoft Graph refresh tokens
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+  TokenEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/emis-token-encryption
+      TargetKeyId: !Ref TokenEncryptionKey
+
+  # Per-user enrollment records. user_id = the Azure object_id (stable across
+  # email changes). email is duplicated for display + lookup; secondary index
+  # would help if we ever lookup-by-email at scale, but for N<100 staff a
+  # Scan is fine and cheaper than a GSI.
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: user_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: user_id, KeyType: HASH}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
 
   StateBucket:
     Type: AWS::S3::Bucket
@@ -85,20 +150,30 @@ Resources:
           TODO_LIST_NAME: !Ref TodoListName
           ONEDRIVE_FOLDER: !Ref OneDriveFolder
           # Web UI URL + token so the agenda email can deep-link into the
-          # interactive dashboard. The token gives access to past agendas
-          # too — keep it private.
-          WEB_UI_URL: !GetAtt WebUiFunctionUrl.FunctionUrl
+          # interactive dashboard. The URL is pinned via SAM parameter to
+          # break a circular dependency (see WebUiUrlOverride above).
+          WEB_UI_URL: !Ref WebUiUrlOverride
           WEB_UI_TOKEN: !Ref WebUiToken
+          # Optional SMS via Twilio. The src/sms.py module no-ops when this
+          # is empty or the secret is missing required fields.
+          EMIS_TWILIO_SECRET_ID: !Ref TwilioSecretId
+          # Multi-tenant: when set, per-invocation event payload includes
+          # user_id and the handler loads that user's tokens from DDB. When
+          # absent, the function falls back to the legacy single-user secret
+          # at GraphSecretId so the old setup keeps working during migration.
+          USERS_TABLE: !Ref UsersTable
+          TOKEN_KMS_KEY_ID: !Ref TokenEncryptionKey
       Policies:
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
+              # Scoped to the emis/ prefix so adding new secrets (twilio,
+              # future channels) doesn't require an IAM redeploy.
               Action:
                 - secretsmanager:GetSecretValue
                 - secretsmanager:PutSecretValue
               Resource:
-                - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GraphSecretId}*
-                - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AnthropicSecretId}*
+                - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:emis/*
             - Effect: Allow
               Action: [ses:SendEmail, ses:SendRawEmail]
               Resource: '*'
@@ -114,8 +189,58 @@ Resources:
               # public Anthropic API too (just unused).
               Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
               Resource:
-                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.*
-                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*anthropic.*
+                - !Sub arn:aws:bedrock:*::foundation-model/anthropic.*
+                - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*anthropic.*
+            - Effect: Allow
+              # Multi-tenant: read + update per-user records (refresh token
+              # rotation lands on UpdateItem after every Graph call).
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+                - dynamodb:PutItem
+                - dynamodb:Scan
+              Resource:
+                - !GetAtt UsersTable.Arn
+            - Effect: Allow
+              # Encrypt/Decrypt the refresh_token attribute we store in DDB.
+              Action: [kms:Encrypt, kms:Decrypt, kms:GenerateDataKey]
+              Resource: !GetAtt TokenEncryptionKey.Arn
+      # EventBridge schedules used to live here; they were moved to the
+      # CoordinatorFunction (multi-tenant fan-out) on the P1g cutover.
+      # AgendaFunction is now invoked by Coordinator with a user_id in the
+      # payload, or directly via manual Test for debugging.
+
+  # ── Coordinator: schedule fan-out for multi-tenant ──────────────────────
+  # EventBridge fires Coordinator on each weekly schedule; Coordinator scans
+  # active users in DDB and invokes AgendaFunction once per user with
+  # {"mode": "...", "user_id": "..."}.
+  CoordinatorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ../
+      Handler: src.coordinator.lambda_handler
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          USERS_TABLE: !Ref UsersTable
+          TOKEN_KMS_KEY_ID: !Ref TokenEncryptionKey
+          AGENDA_FUNCTION_NAME: !Ref AgendaFunction
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:Scan, dynamodb:GetItem]
+              Resource: !GetAtt UsersTable.Arn
+            - Effect: Allow
+              Action: [kms:Decrypt]
+              Resource: !GetAtt TokenEncryptionKey.Arn
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt AgendaFunction.Arn
       Events:
         Monday:
           Type: Schedule
@@ -137,6 +262,83 @@ Resources:
           Properties:
             Schedule: !Ref MorningSchedule
             Input: '{"mode": "morning"}'
+
+  # ── Admin weekly digest: Saturday-morning operational summary ──────────
+  DigestFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ../
+      Handler: src.digest.lambda_handler
+      Runtime: python3.11
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          STATE_BUCKET: !Ref StateBucket
+          USERS_TABLE: !Ref UsersTable
+          TOKEN_KMS_KEY_ID: !Ref TokenEncryptionKey
+          AGENDA_SENDER: !Ref AgendaSenderEmail
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:Scan, dynamodb:GetItem]
+              Resource: !GetAtt UsersTable.Arn
+            - Effect: Allow
+              Action: [kms:Decrypt]
+              Resource: !GetAtt TokenEncryptionKey.Arn
+            - Effect: Allow
+              Action: [s3:GetObject, s3:ListBucket]
+              Resource:
+                - !GetAtt StateBucket.Arn
+                - !Sub ${StateBucket.Arn}/*
+            - Effect: Allow
+              Action: [ses:SendEmail, ses:SendRawEmail]
+              Resource: '*'
+      Events:
+        Saturday:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref AdminDigestSchedule
+            Input: '{}'
+
+  # ── Enrollment: self-service Microsoft 365 OAuth signup ─────────────────
+  EnrollmentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: ../
+      Handler: src.enrollment.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          GRAPH_SECRET_ID: !Ref GraphSecretId
+          USERS_TABLE: !Ref UsersTable
+          TOKEN_KMS_KEY_ID: !Ref TokenEncryptionKey
+          STATE_BUCKET: !Ref StateBucket
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [secretsmanager:GetSecretValue]
+              Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:emis/*
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt UsersTable.Arn
+            - Effect: Allow
+              Action: [kms:Encrypt, kms:GenerateDataKey]
+              Resource: !GetAtt TokenEncryptionKey.Arn
+            - Effect: Allow
+              # Audit log writes (enrollment events).
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub ${StateBucket.Arn}/state/audit/*
+      FunctionUrlConfig:
+        AuthType: NONE  # auth happens via the Azure OAuth flow itself
 
   SnoozeFunction:
     Type: AWS::Serverless::Function
@@ -174,8 +376,8 @@ Resources:
             - Effect: Allow
               Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
               Resource:
-                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.*
-                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*anthropic.*
+                - !Sub arn:aws:bedrock:*::foundation-model/anthropic.*
+                - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*anthropic.*
       Events:
         Poll:
           Type: Schedule
@@ -195,7 +397,22 @@ Resources:
       Environment:
         Variables:
           STATE_BUCKET: !Ref StateBucket
+          # WEB_UI_TOKEN now serves a triple purpose:
+          # (1) HMAC secret for signing Phase 2 session cookies + PKCE state
+          # (2) Legacy fallback auth for old email banner links
+          # (3) Backward-compat for any direct bookmark with ?token=…
           WEB_UI_TOKEN: !Ref WebUiToken
+          # Phase 1 stopgap user_id — used when a request authenticates via
+          # the legacy token but no session cookie is present. Once everyone
+          # is on Phase 2 SSO this can be removed.
+          EMIS_DEFAULT_USER_ID: !Ref DefaultUserId
+          # SSO needs the Azure app's client_id + tenant_id from emis/graph.
+          GRAPH_SECRET_ID: !Ref GraphSecretId
+          USERS_TABLE: !Ref UsersTable
+          TOKEN_KMS_KEY_ID: !Ref TokenEncryptionKey
+          # Admin "run now" invokes the agenda Lambda directly for a single
+          # user. Coordinator does the same on schedule fires.
+          AGENDA_FUNCTION_NAME: !Ref AgendaFunction
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -204,8 +421,48 @@ Resources:
               Resource:
                 - !GetAtt StateBucket.Arn
                 - !Sub ${StateBucket.Arn}/*
+            - Effect: Allow
+              # Dashboard buttons write closures, notes, pins for both the
+              # legacy single-user keys (state/*) and per-user multi-tenant
+              # keys (users/{id}/state/*). Scoped to those two prefixes.
+              Action: [s3:PutObject]
+              Resource:
+                - !Sub ${StateBucket.Arn}/state/closures.json
+                - !Sub ${StateBucket.Arn}/state/notes.json
+                - !Sub ${StateBucket.Arn}/state/pins.json
+                - !Sub ${StateBucket.Arn}/state/audit/*
+                - !Sub ${StateBucket.Arn}/users/*/state/*
+            - Effect: Allow
+              # Phase 4 unenroll deletes everything under the user's prefix.
+              Action: [s3:DeleteObject]
+              Resource: !Sub ${StateBucket.Arn}/users/*
+            - Effect: Allow
+              # SSO callback reads client_id + tenant_id from emis/graph.
+              Action: [secretsmanager:GetSecretValue]
+              Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:emis/*
+            - Effect: Allow
+              # Look up enrolled users by Azure object_id during SSO callback;
+              # Phase 3 admin dashboard scans for the full list; settings page
+              # writes preference updates; Phase 4 self-service unenroll
+              # deletes the record.
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+                - dynamodb:Scan
+                - dynamodb:DeleteItem
+              Resource: !GetAtt UsersTable.Arn
+            - Effect: Allow
+              # Decrypt: users.load_user reads + decrypts refresh_token.
+              # Encrypt + GenerateDataKey: SSO callback stores a freshly
+              # rotated refresh_token (Phase 4 re-auth flow).
+              Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey]
+              Resource: !GetAtt TokenEncryptionKey.Arn
+            - Effect: Allow
+              # Admin "run now" invokes a single per-user agenda run.
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt AgendaFunction.Arn
       FunctionUrlConfig:
-        AuthType: NONE  # auth via WEB_UI_TOKEN in query string
+        AuthType: NONE  # auth via session cookie or legacy token
 
 Outputs:
   FunctionArn:
@@ -215,3 +472,13 @@ Outputs:
   WebUiUrl:
     Value: !GetAtt WebUiFunctionUrl.FunctionUrl
     Description: Append ?token=YOUR_WEB_UI_TOKEN to access.
+  EnrollmentUrl:
+    Value: !GetAtt EnrollmentFunctionUrl.FunctionUrl
+    Description: >
+      Self-service signup URL. Register {url}/callback as a redirect URI on
+      the Azure app before sharing with staff.
+  CoordinatorFunctionName:
+    Value: !Ref CoordinatorFunction
+    Description: Invoke with {"mode":"monday"|"wednesday"|"friday"|"morning"} to fan-out to all active users.
+  UsersTableName:
+    Value: !Ref UsersTable

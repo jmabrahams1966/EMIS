@@ -72,6 +72,8 @@ def build_agenda(
     model: str = "claude-opus-4-7",
     aws_region: str = "us-east-1",
     closures: dict[str, list[dict[str, str]]] | None = None,
+    user_notes: dict[str, str] | None = None,
+    user_pins: list[str] | None = None,
 ) -> AgendaResult:
     """Generate the agenda for ``mode`` in (monday, wednesday, friday)."""
     if mode not in MODE_NOTES:
@@ -86,6 +88,8 @@ def build_agenda(
         attachment_texts=attachment_texts,
         week_start=week_start, week_end=week_end,
         closures=closures or {"snoozes": [], "done": [], "drops": []},
+        user_notes=user_notes or {},
+        user_pins=user_pins or [],
     )
 
     # 64K gives the model room to produce the full agenda without truncating;
@@ -191,6 +195,32 @@ def _render_closures(closures: dict[str, list[dict[str, str]]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _render_user_extras(notes: dict[str, str], pins: list[str]) -> str:
+    """Render USER_NOTES and USER_PINS blocks the prompt will consume."""
+    out: list[str] = []
+    pins = [p for p in pins if p.strip()]
+    if pins:
+        out.append("===== USER_PINS =====")
+        out.append(
+            "These items MUST appear as priorities in the agenda regardless "
+            "of natural ranking. Set pinned: true on the matching priority."
+        )
+        for p in pins:
+            out.append(f"  - {p}")
+        out.append("")
+    notes = {k.strip(): v.strip() for k, v in (notes or {}).items() if k.strip() and v.strip()}
+    if notes:
+        out.append("===== USER_NOTES =====")
+        out.append(
+            "Per-item notes from the user. Copy each note verbatim into the "
+            "matching action_item's user_note field. Treat as ground truth."
+        )
+        for k, v in notes.items():
+            out.append(f"  - {k}: {v}")
+        out.append("")
+    return "\n".join(out) + ("\n" if out else "")
+
+
 def _render_user_turn(
     *,
     mode: str,
@@ -202,6 +232,8 @@ def _render_user_turn(
     week_start: datetime,
     week_end: datetime,
     closures: dict[str, list[dict[str, str]]],
+    user_notes: dict[str, str] | None = None,
+    user_pins: list[str] | None = None,
 ) -> str:
     header = (
         f"{MODE_NOTES[mode]}\n\n"
@@ -213,6 +245,7 @@ def _render_user_turn(
     )
     chunks: list[str] = [header]
     chunks.append(_render_closures(closures))
+    chunks.append(_render_user_extras(user_notes or {}, user_pins or []))
     chunks.append(render_memory_block(prior_agendas, max_chars=MAX_MEMORY_CHARS))
     chunks.append(_render_calendar(calendar_events, max_chars=MAX_CALENDAR_CHARS))
     chunks.append(_render_sent(sent_messages, max_chars=MAX_SENT_CHARS))

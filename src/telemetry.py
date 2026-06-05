@@ -40,6 +40,7 @@ class RunRecord:
     cost_usd: float
     status: str             # "ok" / "error"
     error: str = ""         # populated when status=="error"
+    user_id: str = ""       # multi-tenant attribution; "" for legacy / system runs
 
 
 def _key() -> str:
@@ -68,7 +69,17 @@ def load_runs(bucket: str) -> list[RunRecord]:
         if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
             return []
         raise
-    return [RunRecord(**r) for r in raw]
+    # Backfill missing user_id on legacy records ("" treated as system).
+    out: list[RunRecord] = []
+    for r in raw:
+        r.setdefault("user_id", "")
+        try:
+            out.append(RunRecord(**r))
+        except TypeError:
+            # Ignore extra fields from forward migrations.
+            known = {f.name for f in __import__("dataclasses").fields(RunRecord)}
+            out.append(RunRecord(**{k: v for k, v in r.items() if k in known}))
+    return out
 
 
 def save_runs(bucket: str, runs: list[RunRecord]) -> None:
@@ -90,6 +101,7 @@ def record_run(
     status: str = "ok",
     error: str = "",
     now: datetime | None = None,
+    user_id: str = "",
 ) -> RunRecord:
     """Append a run record to the rolling telemetry store. No-op if no bucket."""
     now = now or datetime.now(timezone.utc)
@@ -101,6 +113,7 @@ def record_run(
         cost_usd=_estimate_cost(input_tokens, output_tokens),
         status=status,
         error=error[:500],  # cap error text
+        user_id=user_id,
     )
     if not bucket:
         return rec
@@ -111,6 +124,43 @@ def record_run(
     runs = [r for r in runs if r.timestamp >= cutoff]
     save_runs(bucket, runs)
     return rec
+
+
+def current_month_cost_for_user(runs: list[RunRecord], user_id: str, now: datetime | None = None) -> float:
+    """Sum this calendar month's Bedrock cost for one user."""
+    now = now or datetime.now(timezone.utc)
+    month_prefix = f"{now.year:04d}-{now.month:02d}-"
+    total = 0.0
+    for r in runs:
+        if r.user_id != user_id:
+            continue
+        if not r.timestamp.startswith(month_prefix):
+            continue
+        total += r.cost_usd
+    return round(total, 4)
+
+
+def summarize_per_user(
+    runs: list[RunRecord], days: int = 30, now: datetime | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return ``{user_id: {runs, cost_usd, errors, last_run}}`` for the window."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=days)).isoformat()
+    by_user: dict[str, dict[str, Any]] = {}
+    for r in runs:
+        if r.timestamp < cutoff:
+            continue
+        uid = r.user_id or "(system)"
+        slot = by_user.setdefault(uid, {
+            "runs": 0, "cost_usd": 0.0, "errors": 0, "last_run": "",
+        })
+        slot["runs"] += 1
+        slot["cost_usd"] = round(slot["cost_usd"] + r.cost_usd, 4)
+        if r.status != "ok":
+            slot["errors"] += 1
+        if r.timestamp > (slot["last_run"] or ""):
+            slot["last_run"] = r.timestamp
+    return by_user
 
 
 def summarize_last_n_days(

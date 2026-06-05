@@ -20,12 +20,15 @@ logger = logging.getLogger(__name__)
 LOOKBACK_WEEKS = 4
 
 
-def _week_key(dt: datetime) -> str:
+def _week_key(dt: datetime, user_id: str | None = None) -> str:
     iso = dt.isocalendar()
-    return f"runs/{iso.year:04d}-W{iso.week:02d}/agenda.json"
+    base = f"{iso.year:04d}-W{iso.week:02d}/agenda.json"
+    return f"users/{user_id}/runs/{base}" if user_id else f"runs/{base}"
 
 
-def load_prior_agendas(bucket: str, current_week: datetime) -> list[dict[str, Any]]:
+def load_prior_agendas(
+    bucket: str, current_week: datetime, user_id: str | None = None,
+) -> list[dict[str, Any]]:
     """Return up to ``LOOKBACK_WEEKS`` previous agendas, newest first.
 
     Each entry is ``{"iso_week": "YYYY-WW", "agenda": {...}}``.
@@ -36,7 +39,7 @@ def load_prior_agendas(bucket: str, current_week: datetime) -> list[dict[str, An
     s3 = boto3.client("s3")
     for weeks_back in range(1, LOOKBACK_WEEKS + 1):
         target = current_week - timedelta(days=7 * weeks_back)
-        key = _week_key(target)
+        key = _week_key(target, user_id)
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
             agenda = json.loads(obj["Body"].read().decode("utf-8"))

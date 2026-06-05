@@ -156,16 +156,18 @@ class Closures:
 
 # ── S3 state ───────────────────────────────────────────────────────────────
 
-def _closures_key() -> str:
+def _closures_key(user_id: str | None = None) -> str:
+    if user_id:
+        return f"users/{user_id}/state/closures.json"
     return "state/closures.json"
 
 
-def load_closures(bucket: str) -> Closures:
+def load_closures(bucket: str, user_id: str | None = None) -> Closures:
     """Load all closures from S3. Returns empty Closures if file missing."""
     if not bucket:
         return Closures()
     try:
-        obj = boto3.client("s3").get_object(Bucket=bucket, Key=_closures_key())
+        obj = boto3.client("s3").get_object(Bucket=bucket, Key=_closures_key(user_id))
         raw = json.loads(obj["Body"].read().decode("utf-8"))
     except ClientError as exc:
         if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
@@ -178,12 +180,12 @@ def load_closures(bucket: str) -> Closures:
     )
 
 
-def save_closures(bucket: str, closures: Closures) -> None:
+def save_closures(bucket: str, closures: Closures, user_id: str | None = None) -> None:
     if not bucket:
         return
     data = json.dumps(closures.to_dict(), indent=2)
     boto3.client("s3").put_object(
-        Bucket=bucket, Key=_closures_key(),
+        Bucket=bucket, Key=_closures_key(user_id),
         Body=data.encode("utf-8"), ContentType="application/json",
     )
 

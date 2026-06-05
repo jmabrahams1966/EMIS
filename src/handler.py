@@ -36,7 +36,12 @@ from .agenda.memory import load_prior_agendas
 from .agenda.threading import group_into_threads
 from .config import load_config
 from .email.dashboard import render_dashboard_html
-from .email.sender import render_briefs_html, render_briefs_text, render_html, render_text, send_via_ses
+from .agenda.retrospective import build_retrospective
+from .email.sender import (
+    render_briefs_html, render_briefs_text, render_html,
+    render_retrospective_html, render_retrospective_text,
+    render_text, send_via_ses,
+)
 from .export import markdown as md_export
 from .graph import auth as graph_auth
 from .graph import calendar as graph_calendar
@@ -51,7 +56,10 @@ from .snooze import (
     DoneRecord, active_snoozes, load_closures, prune_closures, save_closures,
 )
 from .state import store
-from .telemetry import load_runs, record_run, render_telemetry_html, summarize_last_n_days
+from .telemetry import (
+    current_month_cost_for_user,
+    load_runs, record_run, render_telemetry_html, summarize_last_n_days,
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -61,31 +69,142 @@ logger = logging.getLogger("emis")
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    """Entry point invoked by EventBridge. Mode comes from the event."""
+    """Entry point invoked by EventBridge or the Coordinator Lambda.
+
+    Event shape::
+
+        {"mode": "monday" | "wednesday" | "friday" | "morning",
+         "user_id": "..." }  # optional — multi-tenant fan-out passes this
+
+    When ``user_id`` is absent, falls back to the legacy single-user secret
+    at GraphSecretId. When present, loads that user's record from the Users
+    table and operates entirely under per-user S3 / DDB state.
+    """
     mode = (event or {}).get("mode") or os.getenv("MODE", "monday")
+    user_id = (event or {}).get("user_id") or None
     if mode == "morning":
-        return asyncio.run(_run_briefs())
-    return asyncio.run(_run(mode))
+        return asyncio.run(_run_briefs(user_id=user_id))
+    return asyncio.run(_run(mode, user_id=user_id))
 
 
-async def _run(mode: str) -> dict[str, Any]:
+async def _run(mode: str, user_id: str | None = None) -> dict[str, Any]:
     cfg = load_config()
     now = datetime.now(timezone.utc)
     since = default_since(cfg.lookback_days)
 
-    # 1. Auth
-    tokens = await graph_auth.exchange_refresh_token(
-        tenant_id=cfg.graph_tenant_id,
-        client_id=cfg.graph_client_id,
-        client_secret=cfg.graph_client_secret,
-        refresh_token=cfg.graph_refresh_token,
-    )
-    if not cfg.dry_run and tokens.refresh_token != cfg.graph_refresh_token:
-        graph_auth.rotate_refresh_token_secret(
-            os.environ["GRAPH_SECRET_ID"], tokens.refresh_token
+    # Multi-tenant: if invoked with a user_id, load that user's enrollment
+    # record and override the relevant config fields (refresh token, sender
+    # + recipient email, channels, categories). State storage and token
+    # rotation both target DDB for these invocations.
+    user = None
+    if user_id:
+        from .users import load_user as _load_user
+        user = _load_user(user_id)
+        if user is None:
+            logger.error("user_id=%r not found in Users table", user_id)
+            return {"status": "user_not_found", "user_id": user_id}
+        cfg.graph_refresh_token = user.refresh_token
+        cfg.agenda_sender = user.sender_email or user.email
+        cfg.agenda_recipient = user.email
+        logger.info("per-user run: user_id=%s email=%s mode=%s",
+                    user_id, user.email, mode)
+
+        # Monthly cost cap enforcement. If the user has set a cap and this
+        # month's spend already meets/exceeds it, skip generation entirely
+        # and send a short notice instead.
+        cap = user.monthly_cost_cap_usd or 0
+        if cap > 0 and cfg.state_bucket:
+            try:
+                runs_so_far = load_runs(cfg.state_bucket)
+                current_spend = current_month_cost_for_user(runs_so_far, user_id, now)
+                if current_spend >= cap:
+                    logger.warning(
+                        "user %s exceeded monthly cap ($%.2f >= $%d); skipping",
+                        user_id, current_spend, cap,
+                    )
+                    try:
+                        send_via_ses(
+                            sender=cfg.agenda_sender,
+                            recipient=cfg.agenda_recipient,
+                            subject=f"EMIS — monthly cap reached (${cap})",
+                            html=(
+                                f"<p>Your {mode.title()} agenda was skipped because this "
+                                f"month's Bedrock spend (${current_spend:.2f}) has met "
+                                f"your ${cap}/month cap.</p>"
+                                f"<p>The cap resets on the 1st. You can adjust it in "
+                                f"<a href='{cfg.web_ui_url}settings'>settings</a>.</p>"
+                            ),
+                            text=(
+                                f"Agenda skipped — monthly cap reached.\n"
+                                f"Current month: ${current_spend:.2f} / ${cap}.\n"
+                                f"Adjust the cap at {cfg.web_ui_url}settings"
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning("cap notice SES failed: %s", exc)
+                    from .users import record_run_outcome as _record
+                    _record(user_id, ok=False, error=f"monthly cap ${cap} reached")
+                    return {
+                        "status": "skipped_cap_reached",
+                        "user_id": user_id, "mode": mode,
+                        "current_spend": current_spend, "cap": cap,
+                    }
+            except Exception as exc:
+                logger.warning("cost cap check failed: %s", exc)
+
+    # 1. Auth — refresh-token exchange. If Microsoft says the token is
+    # invalid (user changed password, revoked consent, etc.), mark the
+    # multi-tenant user as needs_reauth so future scheduled runs skip them
+    # until they sign in again via /login. Solo legacy path just raises.
+    try:
+        tokens = await graph_auth.exchange_refresh_token(
+            tenant_id=cfg.graph_tenant_id,
+            client_id=cfg.graph_client_id,
+            client_secret=cfg.graph_client_secret,
+            refresh_token=cfg.graph_refresh_token,
         )
-        # Keep the lru_cached Config in sync with Secrets Manager so the next
-        # invocation in this warm container doesn't reuse the stale token.
+    except Exception as exc:
+        msg = str(exc)
+        if user_id and ("invalid_grant" in msg or "AADSTS" in msg or "401" in msg or "400" in msg):
+            logger.warning("user %s token invalid, marking needs_reauth: %s", user_id, msg[:200])
+            try:
+                from .users import update_settings as _us
+                _us(user_id, status="needs_reauth")
+                from .users import record_run_outcome as _record
+                _record(user_id, ok=False, error=f"token expired/revoked: {msg[:200]}")
+                try:
+                    send_via_ses(
+                        sender=cfg.agenda_sender,
+                        recipient=cfg.agenda_recipient,
+                        subject="EMIS — please sign in again",
+                        html=(
+                            f"<p>Your EMIS access to Microsoft 365 has expired or "
+                            f"been revoked (password change, consent revocation, etc.).</p>"
+                            f"<p>Future agendas are paused until you "
+                            f"<a href='{cfg.web_ui_url}login'>sign in again</a>.</p>"
+                        ),
+                        text=(
+                            f"EMIS — please sign in again.\n"
+                            f"Microsoft 365 access expired or was revoked.\n"
+                            f"Sign in: {cfg.web_ui_url}login"
+                        ),
+                    )
+                except Exception as ses_exc:
+                    logger.warning("reauth notice SES failed: %s", ses_exc)
+            except Exception as inner_exc:
+                logger.warning("marking needs_reauth failed: %s", inner_exc)
+            return {"status": "token_invalid", "user_id": user_id, "mode": mode}
+        raise
+    if not cfg.dry_run and tokens.refresh_token != cfg.graph_refresh_token:
+        if user_id:
+            from .users import update_refresh_token as _update_token
+            _update_token(user_id, tokens.refresh_token)
+        else:
+            graph_auth.rotate_refresh_token_secret(
+                os.environ["GRAPH_SECRET_ID"], tokens.refresh_token
+            )
+        # Keep the lru_cached Config in sync so the next invocation in this
+        # warm container doesn't reuse the stale token.
         cfg.graph_refresh_token = tokens.refresh_token
 
     # 2. Filters from S3
@@ -126,18 +245,19 @@ async def _run(mode: str) -> dict[str, Any]:
         dry_run=cfg.dry_run,
         onedrive_folder=cfg.onedrive_folder,
         mirror_to_onedrive=cfg.upload_to_onedrive,
+        user_id=user_id,
     )
 
     # 6. Memory — anchor lookback on `now` so weeks_back=1 is last week,
     # not two weeks ago (since = now - lookback_days).
     prior = (
-        load_prior_agendas(cfg.state_bucket, now)
+        load_prior_agendas(cfg.state_bucket, now, user_id=user_id)
         if cfg.state_bucket else []
     )
 
     # 6b. Closures — load existing state, two-way sync from Microsoft To Do,
     # prune very-old records, then pass the active set to the agenda prompt.
-    closures = prune_closures(load_closures(cfg.state_bucket), now)
+    closures = prune_closures(load_closures(cfg.state_bucket, user_id=user_id), now)
     if cfg.create_todo_tasks and cfg.state_bucket:
         try:
             todo_list_id = await graph_todo.ensure_list(
@@ -167,13 +287,27 @@ async def _run(mode: str) -> dict[str, Any]:
             logger.warning("To Do completion sync failed: %s", exc)
 
     if cfg.state_bucket and not cfg.dry_run:
-        save_closures(cfg.state_bucket, closures)
+        save_closures(cfg.state_bucket, closures, user_id=user_id)
 
     closures_for_prompt = {
         "snoozes": [s.to_dict() for s in active_snoozes(closures, now)],
         "done": [d.to_dict() for d in closures.done],
         "drops": [d.to_dict() for d in closures.drops],
     }
+
+    # 6c. User-supplied dashboard extras: free-text notes per item, and pins
+    # that force items to surface as priorities. Best-effort; missing files
+    # produce empty dict/list.
+    try:
+        user_notes = store.load_notes(cfg.state_bucket, user_id=user_id) if cfg.state_bucket else {}
+    except Exception as exc:
+        logger.warning("loading user_notes failed: %s", exc)
+        user_notes = {}
+    try:
+        user_pins = store.load_pins(cfg.state_bucket, user_id=user_id) if cfg.state_bucket else []
+    except Exception as exc:
+        logger.warning("loading user_pins failed: %s", exc)
+        user_pins = []
 
     # 7. Build the agenda
     result = build_agenda(
@@ -189,11 +323,13 @@ async def _run(mode: str) -> dict[str, Any]:
         model=cfg.anthropic_model,
         aws_region=cfg.aws_region,
         closures=closures_for_prompt,
+        user_notes=user_notes,
+        user_pins=user_pins,
     )
 
     # 9. Persist (was step 9 in the docstring; renders below)
     if cfg.state_bucket and not cfg.dry_run:
-        store.save_agenda(cfg.state_bucket, since, mode, result.agenda)
+        store.save_agenda(cfg.state_bucket, since, mode, result.agenda, user_id=user_id)
 
     # 8. Render
     # Record this run's cost. Telemetry is best-effort — never blocks the
@@ -204,6 +340,7 @@ async def _run(mode: str) -> dict[str, Any]:
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
             now=now,
+            user_id=user_id or "",
         )
     except Exception as exc:
         logger.warning("telemetry record failed: %s", exc)
@@ -212,9 +349,32 @@ async def _run(mode: str) -> dict[str, Any]:
         result.agenda, since, now, mode=mode,
         web_ui_url=cfg.web_ui_url, web_ui_token=cfg.web_ui_token,
     )
-    # On Friday, append a 7-day health summary to the email so the user gets
-    # a recurring sense of cost trajectory + error count.
+    # Friday gets two extras prepended: a retrospective ("what landed/slipped")
+    # and a 7-day telemetry footer. Both are best-effort.
+    retro_html = ""
+    retro_text = ""
     if mode == "friday" and cfg.state_bucket:
+        try:
+            iso = since.isocalendar()
+            week_iso = f"{iso.year:04d}-W{iso.week:02d}"
+            monday_agenda = store.load_agenda(cfg.state_bucket, week_iso, "monday", user_id=user_id)
+            retro = build_retrospective(
+                monday_agenda=monday_agenda,
+                friday_agenda=result.agenda,
+                closures=closures_for_prompt,
+                monday_iso=since.isoformat(),
+            )
+            retro_html = render_retrospective_html(retro)
+            retro_text = render_retrospective_text(retro)
+            if retro_html:
+                # Inject right after the dashboard banner (or h1 if no banner).
+                html = html.replace(
+                    "<h1 style=\"margin-bottom:4px\">",
+                    f"{retro_html}<h1 style=\"margin-bottom:4px\">",
+                    1,
+                )
+        except Exception as exc:
+            logger.warning("retrospective failed: %s", exc)
         try:
             summary = summarize_last_n_days(load_runs(cfg.state_bucket), days=7, now=now)
             footer = render_telemetry_html(summary)
@@ -223,6 +383,8 @@ async def _run(mode: str) -> dict[str, Any]:
         except Exception as exc:
             logger.warning("telemetry summary failed: %s", exc)
     text = render_text(result.agenda, since, now, mode=mode)
+    if retro_text:
+        text = retro_text + "\n" + text
     md_text = md_export.render(result.agenda, since, now, mode=mode)
     try:
         from .export import pdf as pdf_export  # lazy: avoids fpdf2 import at module load
@@ -232,9 +394,10 @@ async def _run(mode: str) -> dict[str, Any]:
         pdf_bytes = None
 
     if cfg.state_bucket and not cfg.dry_run:
-        store.save_artifact(cfg.state_bucket, since, f"agenda.{mode}.md", md_text.encode("utf-8"), "text/markdown")
+        store.save_artifact(cfg.state_bucket, since, f"agenda.{mode}.md", md_text.encode("utf-8"), "text/markdown", user_id=user_id)
+        store.save_artifact(cfg.state_bucket, since, f"agenda.{mode}.html", html.encode("utf-8"), "text/html; charset=utf-8", user_id=user_id)
         if pdf_bytes:
-            store.save_artifact(cfg.state_bucket, since, f"agenda.{mode}.pdf", pdf_bytes, "application/pdf")
+            store.save_artifact(cfg.state_bucket, since, f"agenda.{mode}.pdf", pdf_bytes, "application/pdf", user_id=user_id)
 
     subject = _email_subject(mode, now)
 
@@ -276,23 +439,57 @@ async def _run(mode: str) -> dict[str, Any]:
         side_effects["ses"] = {"error": str(exc)}
 
     if cfg.upload_to_onedrive:
-        side_effects["onedrive"] = await _upload_to_onedrive(
-            access_token=tokens.access_token,
-            folder=cfg.onedrive_folder,
-            week_start=since, mode=mode,
-            md=md_text, pdf_bytes=pdf_bytes,
-        )
+        try:
+            side_effects["onedrive"] = await _upload_to_onedrive(
+                access_token=tokens.access_token,
+                folder=cfg.onedrive_folder,
+                week_start=since, mode=mode,
+                md=md_text, pdf_bytes=pdf_bytes,
+            )
+        except Exception as exc:
+            logger.warning("OneDrive upload failed: %s", exc)
+
+    # Best-effort SMS via Twilio. In multi-tenant mode, only sends if the
+    # user has "sms" in their channels list. In legacy mode, always attempts
+    # (the secret existing in env governs whether it actually fires).
+    sms_enabled = (user is None) or ("sms" in (user.channels or set()))
+    if sms_enabled:
+        try:
+            from .sms import send_agenda_sms
+            iso = since.isocalendar()
+            week_iso = f"{iso.year:04d}-W{iso.week:02d}"
+            if cfg.web_ui_url and cfg.web_ui_token:
+                from urllib.parse import urlencode
+                qs = urlencode({
+                    "token": cfg.web_ui_token, "week": week_iso, "mode": mode,
+                })
+                dashboard_url = f"{cfg.web_ui_url.rstrip('/')}/?{qs}"
+            else:
+                dashboard_url = ""
+            side_effects["sms"] = send_agenda_sms(
+                agenda=result.agenda, mode=mode, dashboard_url=dashboard_url,
+            )
+        except Exception as exc:
+            logger.warning("SMS send failed: %s", exc)
+    else:
+        side_effects["sms"] = {"status": "skipped", "reason": "user_opted_out"}
 
     if cfg.create_todo_tasks and mode in ("monday", "wednesday"):
-        side_effects["todo"] = await graph_todo.sync_action_items(
-            access_token=tokens.access_token,
-            list_name=cfg.todo_list_name,
-            action_items=[
-                a for a in result.agenda.get("action_items", [])
-                if a.get("status") in ("new", "carried_over")
-                and a.get("owner", "").lower() == "you"
-            ],
-        )
+        # Best-effort: a Graph hiccup here must not crash the run, since
+        # the agenda email has already been sent and async-retry would
+        # cause duplicate sends.
+        try:
+            side_effects["todo"] = await graph_todo.sync_action_items(
+                access_token=tokens.access_token,
+                list_name=cfg.todo_list_name,
+                action_items=[
+                    a for a in result.agenda.get("action_items", [])
+                    if a.get("status") in ("new", "carried_over")
+                    and a.get("owner", "").lower() == "you"
+                ],
+            )
+        except Exception as exc:
+            logger.warning("To Do sync_action_items failed: %s", exc)
 
     if mode == "monday":
         # Auto-draft polite nudge replies for stale follow-ups so the user
@@ -348,7 +545,7 @@ async def _run(mode: str) -> dict[str, Any]:
             logger.warning("calendar event upsert failed: %s", exc)
             side_effects["calendar_event"] = {"error": str(exc)}
 
-    return {
+    out = {
         "status": "sent", "mode": mode,
         "messages_processed": len(messages),
         "messages_dropped_by_filter": dropped,
@@ -359,9 +556,16 @@ async def _run(mode: str) -> dict[str, Any]:
         "tokens": _token_dict(result),
         "side_effects": side_effects,
     }
+    if user_id:
+        try:
+            from .users import record_run_outcome as _record
+            _record(user_id, ok=True)
+        except Exception as exc:
+            logger.warning("record_run_outcome failed: %s", exc)
+    return out
 
 
-async def _run_briefs() -> dict[str, Any]:
+async def _run_briefs(user_id: str | None = None) -> dict[str, Any]:
     """Pre-meeting briefs flow — separate from the weekly agenda pipeline.
 
     Fetches today's calendar events, pulls 4 weeks of mail with each event's
@@ -369,6 +573,15 @@ async def _run_briefs() -> dict[str, Any]:
     Skips silently when no meetings are on the calendar today.
     """
     cfg = load_config()
+    if user_id:
+        from .users import load_user as _load_user
+        user = _load_user(user_id)
+        if user is None:
+            logger.error("user_id=%r not found", user_id)
+            return {"status": "user_not_found", "user_id": user_id}
+        cfg.graph_refresh_token = user.refresh_token
+        cfg.agenda_sender = user.sender_email or user.email
+        cfg.agenda_recipient = user.email
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = today_start + timedelta(days=1)
@@ -428,6 +641,7 @@ async def _run_briefs() -> dict[str, Any]:
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
             now=now,
+            user_id=user_id or "",
         )
     except Exception as exc:
         logger.warning("telemetry record failed: %s", exc)
@@ -560,6 +774,7 @@ def _token_dict(result) -> dict[str, int]:
 async def _extract_all_attachments(
     *, access_token, messages, bucket, week_start, max_bytes, dry_run,
     onedrive_folder: str = "", mirror_to_onedrive: bool = False,
+    user_id: str | None = None,
 ):
     out: dict[str, list[tuple[str, str]]] = {}
     iso = week_start.isocalendar()
@@ -581,6 +796,7 @@ async def _extract_all_attachments(
                     store.save_attachment(
                         bucket, week_start, msg.id, att.name,
                         att.content_bytes, att.content_type,
+                        user_id=user_id,
                     )
                 except Exception as exc:
                     logger.warning("S3 put failed for %s: %s", att.name, exc)

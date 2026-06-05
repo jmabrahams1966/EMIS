@@ -116,7 +116,14 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
     pdf.ln(8)
     pdf.set_text_color(0)
 
-    _para(pdf, agenda.get("week_summary", ""))
+    summary = agenda.get("week_summary", "")
+    if isinstance(summary, list):
+        for s in summary:
+            s = str(s).strip()
+            if s:
+                _para(pdf, f"* {s}")
+    else:
+        _para(pdf, str(summary or ""))
 
     _heading(pdf, "Priorities")
     for p in agenda.get("priorities", []):
@@ -154,15 +161,6 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
         weeks_txt = f", open {weeks}w" if weeks else ""
         sub = f"{f.get('ask', '')}   ({f.get('status', 'new')}{weeks_txt})"
         _bullet(pdf, head, sub, link=f.get("web_link", ""))
-
-    if agenda.get("promises_made"):
-        _heading(pdf, "Promises you made")
-        for p in agenda["promises_made"]:
-            head = f"{p.get('commitment', '')}"
-            sub = f"To {p.get('to', '')} by {p.get('by', '')}"
-            if p.get("source_subject"):
-                sub += f"   (source: {p['source_subject']})"
-            _bullet(pdf, head, sub, link=p.get("web_link", ""))
 
     today = week_end.date()
     buckets = _bucket_by_due(agenda.get("action_items", []), today)

@@ -4,7 +4,9 @@ Endpoint reference: https://learn.microsoft.com/en-us/graph/api/user-list-messag
 """
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -59,6 +61,47 @@ SYSTEM_FOLDER_WELL_KNOWN_NAMES = (
     # the agenda.
     "drafts", "sentitems", "deleteditems", "junkemail", "outbox",
 )
+
+
+async def _fetch_json_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict,
+    params: dict | None,
+    attempts: int = 3,
+) -> dict:
+    """GET ``url`` and decode JSON, retrying transient failures.
+
+    Microsoft Graph occasionally returns 2xx with a non-JSON body (gateway
+    blip, partial response). Retry up to ``attempts`` times with exponential
+    backoff. After the last attempt, log the first 200 chars of the offending
+    body and re-raise the parse error so the caller's exception handler can
+    decide whether to fail or proceed without messages.
+    """
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            resp = await client.get(url, headers=headers, params=params)
+            resp.raise_for_status()
+            return resp.json()
+        except (json.JSONDecodeError, httpx.HTTPStatusError, httpx.RequestError) as exc:
+            last_exc = exc
+            if i + 1 < attempts:
+                # 0.5s, 1.5s
+                await asyncio.sleep(0.5 + i)
+                continue
+            body_preview = ""
+            try:
+                body_preview = (resp.text or "")[:200] if resp is not None else ""
+            except Exception:
+                pass
+            logger.warning(
+                "Graph fetch failed after %d attempts: %s; body_preview=%r",
+                attempts, exc, body_preview,
+            )
+            raise
+    # Unreachable
+    raise last_exc  # type: ignore[misc]
 
 
 async def _get_excluded_folder_ids(*, access_token: str) -> set[str]:
@@ -122,9 +165,9 @@ async def list_messages_since(
     out: list[Message] = []
     async with httpx.AsyncClient(timeout=60) as client:
         while url and len(out) < max_messages:
-            resp = await client.get(url, headers=headers, params=params if "$filter" in (params or {}) else None)
-            resp.raise_for_status()
-            payload = resp.json()
+            payload = await _fetch_json_with_retry(
+                client, url, headers, params if "$filter" in (params or {}) else None,
+            )
             for item in payload.get("value", []):
                 # Belt-and-suspenders: still drop anything in excluded folders
                 # in case Graph returned it (some tenants ignore $filter on
@@ -198,12 +241,10 @@ async def list_sent_messages_since(
     out: list[Message] = []
     async with httpx.AsyncClient(timeout=60) as client:
         while url and len(out) < max_messages:
-            resp = await client.get(
-                url, headers=headers,
-                params=params if "$filter" in (params or {}) else None,
+            payload = await _fetch_json_with_retry(
+                client, url, headers,
+                params if "$filter" in (params or {}) else None,
             )
-            resp.raise_for_status()
-            payload = resp.json()
             for item in payload.get("value", []):
                 # sentDateTime is the relevant timestamp for sent mail; fall
                 # back to receivedDateTime if SentItems is being weird.

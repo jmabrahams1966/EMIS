@@ -12,6 +12,17 @@ import boto3
 logger = logging.getLogger(__name__)
 
 _STATUS_MARK = {"new": "•", "carried_over": "↻", "resolved": "✓", "stale": "⚠"}
+
+_STATUS_LABEL = {
+    "new": "",
+    "carried_over": "last week",
+    "resolved": "resolved",
+    "stale": "stale",
+}
+
+
+def _status_label(status: str) -> str:
+    return _STATUS_LABEL.get(status, status or "")
 _URGENCY_COLOR = {"high": "#c0392b", "medium": "#d68910", "low": "#7f8c8d"}
 
 
@@ -41,10 +52,10 @@ def _bucket_by_due(action_items: list[dict[str, Any]], today: date) -> dict[str,
 
 
 def _counterparty_rollup(agenda: dict[str, Any]) -> dict[str, dict[str, list]]:
-    """Build per-counterparty buckets of {owed_to_you, owed_by_you, joint}.
+    """Build per-counterparty buckets of {owed_to_you, owed_by_you}.
 
     - follow_ups → things owed to you
-    - promises_made → things you owe them
+    - action_items (source=promised) → things you owe them
     - action_items with non-self owner → things they owe you
     """
     by_party: dict[str, dict[str, list]] = defaultdict(lambda: {"owed_to_you": [], "owed_by_you": []})
@@ -52,11 +63,12 @@ def _counterparty_rollup(agenda: dict[str, Any]) -> dict[str, dict[str, list]]:
         cp = (f.get("counterparty") or "").strip()
         if cp:
             by_party[cp]["owed_to_you"].append(f)
-    for p in agenda.get("promises_made", []):
-        to = (p.get("to") or "").strip()
-        if to:
-            by_party[to]["owed_by_you"].append(p)
     for a in agenda.get("action_items", []):
+        if a.get("source") == "promised":
+            to = (a.get("to_party") or "").strip()
+            if to:
+                by_party[to]["owed_by_you"].append(a)
+            continue
         owner = (a.get("owner") or "").strip()
         if owner and owner.lower() != "you":
             by_party[owner]["owed_to_you"].append(a)
@@ -74,7 +86,7 @@ def _linked(title_html: str, web_link: str) -> str:
         return title_html
     return (
         f"<a href='{escape(web_link)}' "
-        f"style='color:inherit;text-decoration:underline;text-decoration-color:#aaa'>"
+        f"style='color:#2c6cdf;text-decoration:underline'>"
         f"{title_html}</a>"
     )
 
@@ -100,6 +112,79 @@ def _dashboard_banner(web_ui_url: str, web_ui_token: str, week_iso: str, mode: s
         f"&nbsp;·&nbsp; tabs, calendar links, backlog &amp; history</span>"
         f"</div>"
     )
+
+
+def render_retrospective_html(retro: dict[str, list[dict[str, str]]]) -> str:
+    """Render the Friday retrospective as an HTML block. Empty string if no data."""
+    landed = retro.get("landed", [])
+    slipped = retro.get("slipped", [])
+    carried = retro.get("carried", [])
+    if not (landed or slipped or carried):
+        return ""
+
+    def _bullets(items: list[dict]) -> str:
+        if not items:
+            return "<li style='color:#aaa'>None</li>"
+        return "".join(
+            f"<li style='margin-bottom:4px'>"
+            f"<span style='color:#888;font-size:11px;text-transform:uppercase;"
+            f"margin-right:6px'>{escape(i.get('kind', ''))}</span>"
+            f"{escape(i.get('title', ''))}"
+            + (
+                f" <em style='color:#888;font-size:11px'>({escape(i['reason'])})</em>"
+                if i.get("reason") else ""
+            )
+            + "</li>"
+            for i in items
+        )
+
+    return (
+        f"<div style='background:#f7faff;border:1px solid #cfe0ff;"
+        f"border-radius:8px;padding:14px 18px;margin-bottom:20px'>"
+        f"<h2 style='margin:0 0 8px;font-size:15px;color:#2c6cdf'>"
+        f"This week's retrospective</h2>"
+        f"<div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;font-size:13px'>"
+        f"<div><strong style='color:#1b5e20'>✓ Landed ({len(landed)})</strong>"
+        f"<ul style='margin:6px 0 0;padding-left:18px'>{_bullets(landed)}</ul></div>"
+        f"<div><strong style='color:#b04141'>⚠ Slipped ({len(slipped)})</strong>"
+        f"<ul style='margin:6px 0 0;padding-left:18px'>{_bullets(slipped)}</ul></div>"
+        f"<div><strong style='color:#666'>→ Carries forward ({len(carried)})</strong>"
+        f"<ul style='margin:6px 0 0;padding-left:18px'>{_bullets(carried)}</ul></div>"
+        f"</div></div>"
+    )
+
+
+def render_retrospective_text(retro: dict[str, list[dict[str, str]]]) -> str:
+    landed = retro.get("landed", [])
+    slipped = retro.get("slipped", [])
+    carried = retro.get("carried", [])
+    if not (landed or slipped or carried):
+        return ""
+    lines = ["", "THIS WEEK'S RETROSPECTIVE", ""]
+    lines.append(f"Landed ({len(landed)}):")
+    for i in landed or [{"title": "(none)"}]:
+        lines.append(f"  ✓ [{i.get('kind', '?')}] {i.get('title', '')}")
+    lines.append("")
+    lines.append(f"Slipped ({len(slipped)}):")
+    for i in slipped or [{"title": "(none)"}]:
+        reason = f" ({i['reason']})" if i.get("reason") else ""
+        lines.append(f"  ⚠ [{i.get('kind', '?')}] {i.get('title', '')}{reason}")
+    lines.append("")
+    lines.append(f"Carries forward ({len(carried)}):")
+    for i in carried or [{"title": "(none)"}]:
+        lines.append(f"  → [{i.get('kind', '?')}] {i.get('title', '')}")
+    return "\n".join(lines) + "\n"
+
+
+def _summary_html(summary: Any) -> str:
+    """Render week_summary as bullet list (new schema) or paragraph (legacy)."""
+    if isinstance(summary, list):
+        items = "".join(
+            f"<li style='margin-bottom:6px'>{escape(str(s))}</li>"
+            for s in summary if str(s).strip()
+        )
+        return f"<ul style='font-size:15px;line-height:1.55;padding-left:20px'>{items}</ul>"
+    return f"<p style=\"font-size:15px;line-height:1.55\">{escape(str(summary or ''))}</p>"
 
 
 def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mode: str = "monday", web_ui_url: str = "", web_ui_token: str = "") -> str:
@@ -146,37 +231,55 @@ def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime
     def _action_li(a: dict) -> str:
         # Two bullets per action: task on top, metadata as a nested sub-bullet.
         title = _linked(f"<strong>{escape(a['task'])}</strong>", a.get("web_link", ""))
+        source = a.get("source", "")
+        source_tag = ""
+        if source == "promised":
+            to = escape(a.get("to_party", ""))
+            source_tag = (
+                f"<span style='background:#fff4e0;color:#a55a00;font-size:10px;"
+                f"padding:1px 5px;border-radius:3px;margin-right:4px;"
+                f"text-transform:uppercase;letter-spacing:0.4px'>promised{f' → {to}' if to else ''}</span>"
+            )
+        elif source == "asked":
+            source_tag = (
+                f"<span style='background:#eef4ff;color:#2c6cdf;font-size:10px;"
+                f"padding:1px 5px;border-radius:3px;margin-right:4px;"
+                f"text-transform:uppercase;letter-spacing:0.4px'>asked</span>"
+            )
         meta_bits = [
             urgency_badge(a.get("urgency", "medium")),
             escape(a.get("owner", "?")),
             f"due {escape(a.get('due', ''))}" if a.get("due") else "",
-            escape(a.get("status", "new")),
+            escape(_status_label(a.get("status", "new"))),
         ]
+        if a.get("category"):
+            meta_bits.append(escape(a["category"]))
         meta = " · ".join(b for b in meta_bits if b)
         src = (
             f"<em style='color:#888'>({escape(a['source_subject'])})</em>"
             if a.get("source_subject") else ""
         )
+        note = ""
+        if a.get("user_note"):
+            note = (
+                f"<li style='color:#2c6cdf;font-size:12px;font-style:italic'>"
+                f"📝 {escape(a['user_note'])}</li>"
+            )
         sub_bullet = (
             f"<ul style='margin:2px 0 0 0;padding-left:18px;color:#666;font-size:12px'>"
-            f"<li>{meta} {src}</li></ul>"
+            f"<li>{meta} {src}</li>{note}</ul>"
         )
-        return f"{status_badge(a.get('status', 'new'))} {title}{sub_bullet}"
+        return f"{status_badge(a.get('status', 'new'))} {source_tag}{title}{sub_bullet}"
 
     def _followup_li(f: dict) -> str:
         title = _linked(f"<strong>{escape(f['thread'])}</strong>", f.get("web_link", ""))
         weeks = f" <span style='color:#888'>(open {f['weeks_open']}w)</span>" if f.get("weeks_open") else ""
         return f"{status_badge(f.get('status', 'new'))} {title} — waiting on {escape(f['counterparty'])}: {escape(f['ask'])}{weeks}"
 
-    def _promise_li(p: dict) -> str:
-        title = _linked(f"<strong>{escape(p['commitment'])}</strong>", p.get("web_link", ""))
-        return f"{title} <span style='color:#666'>to {escape(p['to'])} by {escape(p['by'])}</span>"
-
     priorities = ul([_priority_li(p) for p in agenda.get("priorities", [])])
     meetings = ul([_meeting_li(m) for m in agenda.get("meetings", [])])
     actions = ul([_action_li(a) for a in agenda.get("action_items", [])])
     follow_ups = ul([_followup_li(f) for f in agenda.get("follow_ups", [])])
-    promises = ul([_promise_li(p) for p in agenda.get("promises_made", [])])
     fyi = ul([escape(x) for x in agenda.get("fyi", [])])
 
     body_html = "".join([
@@ -185,8 +288,6 @@ def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime
         section("Action items", actions),
         section("Follow-ups (waiting on others)", follow_ups),
     ])
-    if agenda.get("promises_made"):
-        body_html += section("Promises you made", promises)
 
     # Computed sections — derived from the data above, no extra LLM tokens.
     today = week_end.date()
@@ -237,7 +338,7 @@ def render_html(agenda: dict[str, Any], week_start: datetime, week_end: datetime
   {banner}
   <h1 style="margin-bottom:4px">{escape(title)}</h1>
   <p style="color:#666;margin-top:0">{week_start.date()} – {week_end.date()}</p>
-  <p style="font-size:15px;line-height:1.55">{escape(agenda.get('week_summary', ''))}</p>
+  {_summary_html(agenda.get('week_summary', ''))}
   {body_html}
   <hr style="margin-top:32px;border:none;border-top:1px solid #eee">
   <p style="color:#aaa;font-size:11px">Generated by EMIS. Status: • new, ↻ carried over, ✓ resolved, ⚠ stale.</p>
@@ -252,11 +353,16 @@ def render_text(agenda: dict[str, Any], week_start: datetime, week_end: datetime
         "friday": "END-OF-WEEK RECAP",
     }.get(mode, "AGENDA")
 
+    summary = agenda.get("week_summary", "")
+    if isinstance(summary, list):
+        summary_lines = [f"  • {str(s).strip()}" for s in summary if str(s).strip()]
+    else:
+        summary_lines = [str(summary or "")]
     lines = [
         title,
         f"{week_start.date()} – {week_end.date()}",
         "",
-        agenda.get("week_summary", ""),
+        *summary_lines,
         "",
         "PRIORITIES",
     ]
@@ -279,17 +385,25 @@ def render_text(agenda: dict[str, Any], week_start: datetime, week_end: datetime
     lines += ["", "ACTION ITEMS"]
     for a in agenda.get("action_items", []):
         mark = _STATUS_MARK.get(a.get("status", "new"), "•")
-        # Two-bullet style: task on top, metadata as indented sub-bullet.
-        lines.append(f"  {mark} {a['task']}")
+        tag = ""
+        if a.get("source") == "promised":
+            to = a.get("to_party", "")
+            tag = f"[promised{(' → ' + to) if to else ''}] "
+        elif a.get("source") == "asked":
+            tag = "[asked] "
+        lines.append(f"  {mark} {tag}{a['task']}")
         meta_bits = list(filter(None, [
             f"[{a.get('urgency', 'medium')}]",
             a.get("owner", "?"),
             f"due {a.get('due', '')}" if a.get("due") else "",
-            a.get("status", "new"),
+            _status_label(a.get("status", "new")),
+            a.get("category", ""),
         ]))
         meta = " · ".join(meta_bits)
         src = f" ({a['source_subject']})" if a.get("source_subject") else ""
         lines.append(f"      - {meta}{src}")
+        if a.get("user_note"):
+            lines.append(f"      📝 {a['user_note']}")
         if a.get("web_link"):
             lines.append(f"        {a['web_link']}")
 
@@ -300,13 +414,6 @@ def render_text(agenda: dict[str, Any], week_start: datetime, week_end: datetime
         lines.append(f"  {mark} {f['thread']} — waiting on {f['counterparty']}: {f['ask']}{weeks}")
         if f.get("web_link"):
             lines.append(f"      {f['web_link']}")
-
-    if agenda.get("promises_made"):
-        lines += ["", "PROMISES MADE"]
-        for p in agenda["promises_made"]:
-            lines.append(f"  • {p['commitment']} → {p['to']} by {p['by']}")
-            if p.get("web_link"):
-                lines.append(f"      {p['web_link']}")
 
     # Computed sections
     today = week_end.date()

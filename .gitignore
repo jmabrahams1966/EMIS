@@ -10,3 +10,7 @@ __pycache__/
 skills-lock.json
 preview/
 
+# Contains parameter overrides including WebUiToken (HMAC secret) and
+# any other deploy-time secrets. Never commit.
+infrastructure/samconfig.toml
+

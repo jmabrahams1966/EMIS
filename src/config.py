@@ -110,5 +110,6 @@ def load_config() -> Config:
         create_todo_tasks=_bool("CREATE_TODO_TASKS", True),
         upload_to_onedrive=_bool("UPLOAD_TO_ONEDRIVE", True),
         web_ui_token=os.getenv("WEB_UI_TOKEN", ""),
+        web_ui_url=os.getenv("WEB_UI_URL", ""),
         dry_run=False,
     )

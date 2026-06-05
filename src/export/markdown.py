@@ -37,11 +37,12 @@ def _counterparty_rollup(agenda: dict[str, Any]) -> dict[str, dict[str, list]]:
         cp = (f.get("counterparty") or "").strip()
         if cp:
             by_party[cp]["owed_to_you"].append(f)
-    for p in agenda.get("promises_made", []):
-        to = (p.get("to") or "").strip()
-        if to:
-            by_party[to]["owed_by_you"].append(p)
     for a in agenda.get("action_items", []):
+        if a.get("source") == "promised":
+            to = (a.get("to_party") or "").strip()
+            if to:
+                by_party[to]["owed_by_you"].append(a)
+            continue
         owner = (a.get("owner") or "").strip()
         if owner and owner.lower() != "you":
             by_party[owner]["owed_to_you"].append(a)
@@ -61,7 +62,14 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
     out.append(f"# {title}")
     out.append(f"*Week of {week_start.date()} – {week_end.date()}*")
     out.append("")
-    out.append(agenda.get("week_summary", ""))
+    summary = agenda.get("week_summary", "")
+    if isinstance(summary, list):
+        for s in summary:
+            s = str(s).strip()
+            if s:
+                out.append(f"- {s}")
+    else:
+        out.append(str(summary or ""))
     out.append("")
 
     out.append("## Priorities")
@@ -96,13 +104,23 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
         owner = a.get("owner", "?")
         src = f" — *{a['source_subject']}*" if a.get("source_subject") else ""
         marker = {"new": "•", "carried_over": "↻", "resolved": "✓", "stale": "⚠"}.get(status, "•")
+        tag = ""
+        if a.get("source") == "promised":
+            to = a.get("to_party", "")
+            tag = f"`promised{(' → ' + to) if to else ''}` "
+        elif a.get("source") == "asked":
+            tag = "`asked` "
         title = _md_link(f"**{a.get('task', '')}**", a.get("web_link", ""))
-        # Two-bullet style: task on top, metadata as nested sub-bullet.
-        out.append(f"- {marker} {title}")
-        meta = " · ".join(filter(None, [
+        out.append(f"- {marker} {tag}{title}")
+        meta_bits = [
             f"[{urgency}]", owner, f"due {due}" if due else "", status,
-        ]))
+        ]
+        if a.get("category"):
+            meta_bits.append(a["category"])
+        meta = " · ".join(filter(None, meta_bits))
         out.append(f"    - {meta}{src}")
+        if a.get("user_note"):
+            out.append(f"    - 📝 *{a['user_note']}*")
     out.append("")
 
     out.append("## Follow-ups (waiting on others)")
@@ -117,13 +135,6 @@ def render(agenda: dict[str, Any], week_start: datetime, week_end: datetime, mod
             f"{f.get('ask', '')} ({status}{weeks_txt})"
         )
     out.append("")
-
-    if agenda.get("promises_made"):
-        out.append("## Promises you made")
-        for p in agenda["promises_made"]:
-            title = _md_link(f"**{p.get('commitment', '')}**", p.get("web_link", ""))
-            out.append(f"- {title} to {p.get('to', '')} by {p.get('by', '')}")
-        out.append("")
 
     # Computed sections — derived from existing data.
     today = week_end.date()

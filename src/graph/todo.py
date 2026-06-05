@@ -85,18 +85,22 @@ async def list_existing_titles(access_token: str, list_id: str) -> set[str]:
     Used to dedupe so we don't keep recreating the same task week after week.
     """
     headers = {"Authorization": f"Bearer {access_token}"}
-    params = {"$filter": "status ne 'completed'", "$top": "200", "$select": "title"}
+    # Graph To Do rejects `status ne 'completed'` with 400, so fetch all and
+    # filter completed ones out client-side.
+    params = {"$top": "200", "$select": "title,status"}
     titles: set[str] = set()
     url = f"{GRAPH_BASE}/me/todo/lists/{list_id}/tasks"
     async with httpx.AsyncClient(timeout=30) as client:
         while url:
             resp = await client.get(
                 url, headers=headers,
-                params=params if "$filter" in (params or {}) else None,
+                params=params if "$top" in (params or {}) else None,
             )
             resp.raise_for_status()
             payload = resp.json()
             for t in payload.get("value", []):
+                if t.get("status") == "completed":
+                    continue
                 if t.get("title"):
                     titles.add(t["title"].strip().lower())
             url = payload.get("@odata.nextLink")
