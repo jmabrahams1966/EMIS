@@ -741,23 +741,22 @@ def _write_previews(
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def _calendar_window(mode: str, now: datetime) -> tuple[datetime, datetime]:
-    """Calendar window depends on mode.
+# The agenda always covers a strict rolling window: today through the next
+# N days. Bump this to change the span (e.g. 6 for "today + 5 more days").
+AGENDA_WINDOW_DAYS = 5
 
-      monday    → coming 7 days
-      wednesday → rest of this week (today through Sunday)
-      friday    → coming Monday through next Sunday (look-ahead)
+
+def _calendar_window(mode: str, now: datetime) -> tuple[datetime, datetime]:
+    """Strict rolling window — today 00:00 through today + AGENDA_WINDOW_DAYS,
+    regardless of mode.
+
+    Previously the window varied by mode (coming week / rest-of-week /
+    next-week look-ahead), which made the agenda's date span jump around. The
+    agenda should always look forward from *today* for a fixed number of days.
+    `mode` still selects the prompt framing/tone, not the date range.
     """
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    if mode == "monday":
-        return midnight, midnight + timedelta(days=7)
-    if mode == "wednesday":
-        end_of_week = midnight + timedelta(days=(6 - midnight.weekday()) + 1)
-        return midnight, end_of_week
-    # friday
-    days_to_monday = (7 - midnight.weekday()) % 7 or 7
-    next_monday = midnight + timedelta(days=days_to_monday)
-    return next_monday, next_monday + timedelta(days=7)
+    return midnight, midnight + timedelta(days=AGENDA_WINDOW_DAYS)
 
 
 def _email_subject(mode: str, now: datetime) -> str:
