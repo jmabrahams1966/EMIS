@@ -317,8 +317,13 @@ async def _run(mode: str, user_id: str | None = None) -> dict[str, Any]:
         calendar_events=calendar_events,
         prior_agendas=prior,
         attachment_texts=attachment_texts,
-        week_start=since,
-        week_end=now,
+        # Frame the agenda by the FORWARD calendar window (today → look-ahead),
+        # not the backward mail-lookback `since`. `since` still scopes which
+        # emails we ingest for context; it must not define the agenda period,
+        # or the agenda reads as "the prior week" instead of the days ahead.
+        week_start=cal_start,
+        week_end=cal_end,
+        now=now,
         api_key=cfg.anthropic_api_key,
         model=cfg.anthropic_model,
         aws_region=cfg.aws_region,
