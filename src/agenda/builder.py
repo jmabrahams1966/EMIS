@@ -68,6 +68,7 @@ def build_agenda(
     attachment_texts: dict[str, list[tuple[str, str]]],
     week_start: datetime,
     week_end: datetime,
+    now: datetime,
     api_key: str,
     model: str = "claude-opus-4-7",
     aws_region: str = "us-east-1",
@@ -86,7 +87,7 @@ def build_agenda(
         mode=mode, threads=threads, sent_messages=sent_messages,
         calendar_events=calendar_events, prior_agendas=prior_agendas,
         attachment_texts=attachment_texts,
-        week_start=week_start, week_end=week_end,
+        week_start=week_start, week_end=week_end, now=now,
         closures=closures or {"snoozes": [], "done": [], "drops": []},
         user_notes=user_notes or {},
         user_pins=user_pins or [],
@@ -231,6 +232,7 @@ def _render_user_turn(
     attachment_texts: dict[str, list[tuple[str, str]]],
     week_start: datetime,
     week_end: datetime,
+    now: datetime,
     closures: dict[str, list[dict[str, str]]],
     user_notes: dict[str, str] | None = None,
     user_pins: list[str] | None = None,
@@ -241,7 +243,7 @@ def _render_user_turn(
         f"Threads: {len(threads)}  "
         f"Sent: {len(sent_messages)}  "
         f"Calendar events: {len(calendar_events)}\n"
-        f"Today's date: {week_end.date().isoformat()}\n"
+        f"Today's date: {now.date().isoformat()}\n"
     )
     chunks: list[str] = [header]
     chunks.append(_render_closures(closures))
